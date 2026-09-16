@@ -1347,52 +1347,46 @@ install_fail2ban() {
         # Используем jail.local (не jail.conf) — не перезаписывается при обновлении
         cat > /etc/fail2ban/jail.local << 'F2B'
 # /etc/fail2ban/jail.local
-# Создан server-init.sh — не редактируйте jail.conf
+# Создан server-init.sh
+# ВАЖНО: fail2ban НЕ поддерживает inline-комментарии (# ...) после значений!
+# Все комментарии — только на отдельной строке.
 
 [DEFAULT]
-# ── Глобальные настройки ──────────────────────────────────────────────────────
-bantime          = 1h           # блокировать на 1 час
-findtime         = 10m          # окно поиска попыток
-maxretry         = 5            # макс. попыток в окне findtime
-banaction        = iptables-multiport
+# Заблокировать на 1 час при 5 попытках за 10 минут
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+banaction          = iptables-multiport
 banaction_allports = iptables-allports
-backend          = auto
-usedns           = warn
-logencoding      = auto
-enabled          = false        # джейлы выключены по умолчанию, включаем явно
+backend            = auto
+usedns             = warn
+logencoding        = auto
 
-# ── Уведомления ───────────────────────────────────────────────────────────────
-# destemail = admin@example.com
-# sender    = fail2ban@example.com
-# mta       = sendmail
-# action    = %(action_mwl)s   # раскомментировать для email-уведомлений
+# Все джейлы выключены по умолчанию; включаем явно ниже
+enabled = false
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SSH — основной джейл
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── SSH ──────────────────────────────────────────────────────────────────────
 [sshd]
 enabled  = true
 port     = ssh
 filter   = sshd
 logpath  = %(sshd_log)s
 backend  = %(sshd_backend)s
-maxretry = 5            # 5 неудачных попыток → бан на 1 час
+maxretry = 5
 bantime  = 1h
 findtime = 10m
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RECIDIVE — «рецидивист»
-# Блокирует IP, который уже банился несколько раз подряд
-# Принцип: если IP попал в бан 5+ раз за 24 часа → бан на 2 недели
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── RECIDIVE ─────────────────────────────────────────────────────────────────
+# Джейл «рецидивиста»: если IP попал в бан 5+ раз за сутки — блок на 2 недели
 [recidive]
 enabled  = true
 filter   = recidive
 logpath  = /var/log/fail2ban.log
-action   = iptables-allports[name=recidive]
-bantime  = 2w           # 2 недели блокировки
-findtime = 1d           # окно поиска: сутки
-maxretry = 5            # 5 банов в сутки → recidive
+banaction = %(banaction_allports)s
+bantime  = 2w
+findtime = 1d
+maxretry = 5
 F2B
 
         log_ok "Создан /etc/fail2ban/jail.local"
