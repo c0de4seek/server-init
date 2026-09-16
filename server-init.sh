@@ -167,6 +167,60 @@ EOF
     log_ok "apt-get update выполнен"
 }
 
+# ─── 1б. Настройка источников apt ────────────────────────────────────────────
+# На минимальных облачных образах Debian часто отсутствуют contrib/non-free
+# и backports — из-за этого пакеты типа jq, chafa, bat, build-essential
+# не находятся. Добавляем нужные источники.
+setup_apt_sources() {
+    log_section "1б · Настройка источников apt"
+
+    local codename; codename=$(grep '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    local os_id;    os_id=$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+
+    if [[ "$os_id" != "debian" ]]; then
+        log_skip "Не Debian — пропускаем настройку источников"
+        return 0
+    fi
+
+    [[ -z "$codename" ]] && codename=$(lsb_release -sc 2>/dev/null || echo "bullseye")
+    log_info "Debian codename: ${codename}"
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+        local src="/etc/apt/sources.list"
+        local changed=false
+
+        # ── contrib non-free ──────────────────────────────────────────────────
+        if grep -q "^deb " "$src" 2>/dev/null && ! grep -q "non-free" "$src" 2>/dev/null; then
+            sed -i '/^deb http.*debian\.org\/debian[[:space:]]/ s/$/ contrib non-free/' "$src" 2>/dev/null || true
+            changed=true
+            log_ok "Добавлены contrib non-free в sources.list"
+        fi
+
+        # ── security ──────────────────────────────────────────────────────────
+        if ! grep -qE "^deb.*security" "$src" 2>/dev/null; then
+            echo "deb http://security.debian.org/debian-security ${codename}-security main contrib non-free" >> "$src"
+            changed=true
+            log_ok "Добавлен ${codename}-security"
+        fi
+
+        # ── backports (chafa, более новые версии jq, bat и др.) ──────────────
+        if ! grep -q "backports" "$src" 2>/dev/null; then
+            echo "deb http://deb.debian.org/debian ${codename}-backports main contrib non-free" >> "$src"
+            changed=true
+            log_ok "Добавлены ${codename}-backports"
+        fi
+
+        if [[ "$changed" == "true" ]]; then
+            apt-get update -qq
+            log_ok "apt-get update после обновления источников"
+        else
+            log_skip "Источники apt уже настроены"
+        fi
+    else
+        echo -e "  ${DIM}[dry-run] проверка/дополнение /etc/apt/sources.list${RESET}"
+    fi
+}
+
 # ─── 2. Установка пакетов ─────────────────────────────────────────────────────
 install_packages() {
     log_section "2 · Установка CLI-утилит"
@@ -268,27 +322,56 @@ install_btop() {
         return 0
     fi
 
-    # Fallback: скачиваем бинарник с GitHub
+    # Пробуем через backports
+    if apt-get install -y -qq -t "*-backports" btop 2>/dev/null; then
+        log_ok "btop установлен из backports"
+        return 0
+    fi
+
+    # Fallback: GitHub API → актуальный URL бинарника
     local arch; arch=$(uname -m)
-    local btop_url
+    local arch_suffix
     case "$arch" in
-        x86_64)  btop_url="https://github.com/aristocratos/btop/releases/latest/download/btop-x86_64-linux-musl.tbz" ;;
-        aarch64) btop_url="https://github.com/aristocratos/btop/releases/latest/download/btop-aarch64-linux-musl.tbz" ;;
+        x86_64)  arch_suffix="x86_64-linux-musl" ;;
+        aarch64) arch_suffix="aarch64-linux-musl" ;;
         *)
             log_warn "btop: неподдерживаемая архитектура ${arch}"
             return 0
             ;;
     esac
 
+    log_step "Ищем актуальный btop release через GitHub API..."
+    # Используем grep+sed вместо jq (jq может быть не установлен ещё)
+    local btop_url
+    btop_url=$(curl -fsSL "https://api.github.com/repos/aristocratos/btop/releases/latest" 2>/dev/null \
+        | grep -o '"browser_download_url": *"[^"]*'"${arch_suffix}"'[^"]*\(tbz\|tar\.bz2\)"' \
+        | head -1 | cut -d'"' -f4)
+
+    if [[ -z "$btop_url" ]]; then
+        log_warn "btop: не удалось получить URL из GitHub API"
+        return 0
+    fi
+
+    log_info "btop URL: ${btop_url}"
     local tmp_dir; tmp_dir=$(mktemp -d)
-    if run curl -fsSL "$btop_url" -o "${tmp_dir}/btop.tbz"; then
-        run tar -xjf "${tmp_dir}/btop.tbz" -C "$tmp_dir"
-        run install -Dm755 "${tmp_dir}/btop/bin/btop" /usr/local/bin/btop
-        log_ok "btop установлен из GitHub release"
+    trap 'rm -rf "$tmp_dir"' RETURN
+
+    local ext="tbz"
+    [[ "$btop_url" == *".tar.bz2" ]] && ext="tar.bz2"
+
+    if run curl -fsSL "$btop_url" -o "${tmp_dir}/btop.${ext}"; then
+        run tar -xjf "${tmp_dir}/btop.${ext}" -C "$tmp_dir"
+        # btop распаковывается в подпапку btop/
+        local btop_bin; btop_bin=$(find "$tmp_dir" -name btop -type f | head -1)
+        if [[ -n "$btop_bin" ]]; then
+            run install -Dm755 "$btop_bin" /usr/local/bin/btop
+            log_ok "btop установлен из GitHub release"
+        else
+            log_warn "btop: бинарник не найден в архиве"
+        fi
     else
         log_warn "Не удалось загрузить btop с GitHub"
     fi
-    rm -rf "$tmp_dir"
 }
 
 install_fzf() {
@@ -1261,14 +1344,27 @@ harden_ssh() {
 
     # ── Проверяем, есть ли авторизованные ключи у root ───────────────────────
     local root_keys="/root/.ssh/authorized_keys"
-    if [[ ! -f "$root_keys" ]] || [[ ! -s "$root_keys" ]]; then
-        log_warn "ВНИМАНИЕ: /root/.ssh/authorized_keys пуст или не существует!"
+
+    # Очищаем мусорные строки (некоторые роутеры/панели вставляют текстовый вывод)
+    if [[ -f "$root_keys" ]] && grep -qvE '^(ssh-|ecdsa-|sk-|#|$)' "$root_keys" 2>/dev/null; then
+        log_step "Очищаем мусорные строки из authorized_keys..."
+        local cleaned; cleaned=$(grep -E '^(ssh-|ecdsa-|sk-)' "$root_keys")
+        # Убираем дубликаты, сохраняем порядок
+        echo "$cleaned" | awk '!seen[$0]++' > "$root_keys"
+        log_ok "authorized_keys очищен от нестандартных строк"
+    fi
+
+    # Считаем реальные ключи (строки начинающиеся с ssh-/ecdsa-/sk-)
+    local key_count; key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$root_keys" 2>/dev/null || echo 0)
+
+    if [[ ! -f "$root_keys" ]] || (( key_count == 0 )); then
+        log_warn "ВНИМАНИЕ: /root/.ssh/authorized_keys не содержит валидных ключей!"
         log_warn "Добавьте SSH-ключ в authorized_keys ПЕРЕД перезапуском sshd,"
         log_warn "иначе потеряете доступ к серверу."
         log_warn "Пропускаем отключение пароля — раскомментируйте и перезапустите вручную."
         return 0
     fi
-    log_ok "Найдены authorized_keys: $(wc -l < "$root_keys") ключ(ей)"
+    log_ok "Найдены authorized_keys: ${key_count} валидных ключей"
 
     if [[ "$DRY_RUN" != "true" ]]; then
         # Функция-помощник: установить/заменить директиву в sshd_config
@@ -1408,12 +1504,17 @@ RECIDIVE
         run systemctl enable fail2ban
         run systemctl restart fail2ban
 
-        # Ждём секунду и проверяем статус
-        sleep 2
+        # Ждём и проверяем статус
+        sleep 3
         if systemctl is-active --quiet fail2ban; then
             log_ok "fail2ban запущен и включён в автозагрузку"
         else
-            log_warn "fail2ban не запустился — проверьте: journalctl -u fail2ban"
+            log_warn "fail2ban не запустился — последние строки лога:"
+            journalctl -u fail2ban --no-pager -n 15 2>/dev/null \
+                | grep -v "^--" | tail -10 | while read -r line; do
+                    echo -e "  ${RED}│${RESET} ${DIM}${line}${RESET}"
+                done
+            log_warn "Полный лог: journalctl -u fail2ban --no-pager"
         fi
 
         # ── Показываем статус джейлов ─────────────────────────────────────────
@@ -1554,6 +1655,7 @@ main() {
 
     preflight_checks
     setup_system
+    setup_apt_sources
     install_packages
     install_view_pdf
     configure_bash
