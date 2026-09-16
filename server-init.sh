@@ -177,15 +177,29 @@ install_packages() {
     fi
 
     # ── Базовые зависимости ──
+    # software-properties-common существует только в Ubuntu; на Debian пропускаем
+    local os_id; os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
     local base_deps=(
         curl wget git ca-certificates gnupg apt-transport-https
-        build-essential software-properties-common unzip
+        build-essential unzip
         poppler-utils  # pdftoppm + pdftotext
     )
+    [[ "$os_id" == "ubuntu" ]] && base_deps+=(software-properties-common)
 
     log_step "Устанавливаем базовые зависимости..."
-    run apt-get install -y -qq "${base_deps[@]}"
-    log_ok "Базовые зависимости установлены"
+    local failed_base=()
+    for pkg in "${base_deps[@]}"; do
+        if ! run apt-get install -y -qq "$pkg" 2>/dev/null; then
+            log_warn "Базовый пакет '${pkg}' недоступен — пропущен"
+            failed_base+=("$pkg")
+        fi
+    done
+    if [[ ${#failed_base[@]} -eq 0 ]]; then
+        log_ok "Базовые зависимости установлены"
+    else
+        log_warn "Некоторые базовые пакеты пропущены: ${failed_base[*]}"
+    fi
 
     # ── Системные утилиты мониторинга и диагностики ──
     local cli_tools=(
@@ -1226,7 +1240,209 @@ NANO
     fi
 }
 
-# ─── 9. Итоговая проверка ─────────────────────────────────────────────────────
+# ─── 9. SSH Hardening ────────────────────────────────────────────────────────
+harden_ssh() {
+    log_section "9 · SSH Hardening (ключ-only, отключение паролей)"
+
+    local sshd_cfg="/etc/ssh/sshd_config"
+
+    if [[ ! -f "$sshd_cfg" ]]; then
+        log_warn "sshd_config не найден — SSH не установлен, пропускаем"
+        return 0
+    fi
+
+    # ── Резервная копия ───────────────────────────────────────────────────────
+    if [[ ! -f "${sshd_cfg}.bak" ]]; then
+        run cp "$sshd_cfg" "${sshd_cfg}.bak"
+        log_ok "Резервная копия: ${sshd_cfg}.bak"
+    else
+        log_skip "Резервная копия уже существует"
+    fi
+
+    # ── Проверяем, есть ли авторизованные ключи у root ───────────────────────
+    local root_keys="/root/.ssh/authorized_keys"
+    if [[ ! -f "$root_keys" ]] || [[ ! -s "$root_keys" ]]; then
+        log_warn "ВНИМАНИЕ: /root/.ssh/authorized_keys пуст или не существует!"
+        log_warn "Добавьте SSH-ключ в authorized_keys ПЕРЕД перезапуском sshd,"
+        log_warn "иначе потеряете доступ к серверу."
+        log_warn "Пропускаем отключение пароля — раскомментируйте и перезапустите вручную."
+        return 0
+    fi
+    log_ok "Найдены authorized_keys: $(wc -l < "$root_keys") ключ(ей)"
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+        # Функция-помощник: установить/заменить директиву в sshd_config
+        sshd_set() {
+            local directive="$1" value="$2"
+            if grep -qE "^#?[[:space:]]*${directive}[[:space:]]" "$sshd_cfg"; then
+                sed -i -E "s|^#?[[:space:]]*${directive}[[:space:]].*|${directive} ${value}|" "$sshd_cfg"
+            else
+                echo "${directive} ${value}" >> "$sshd_cfg"
+            fi
+        }
+
+        # ── Основные настройки безопасности ──────────────────────────────────
+        sshd_set "PermitRootLogin"            "prohibit-password"  # root только по ключу
+        sshd_set "PasswordAuthentication"     "no"                  # пароли запрещены
+        sshd_set "PubkeyAuthentication"       "yes"                 # ключи обязательны
+        sshd_set "AuthorizedKeysFile"         ".ssh/authorized_keys"
+        sshd_set "PermitEmptyPasswords"       "no"
+        sshd_set "ChallengeResponseAuthentication" "no"
+        sshd_set "KbdInteractiveAuthentication"    "no"
+        sshd_set "UsePAM"                     "yes"
+
+        # ── Дополнительное ужесточение ────────────────────────────────────────
+        sshd_set "X11Forwarding"              "no"
+        sshd_set "PrintMotd"                  "no"    # MOTD выводим сами через bashrc
+        sshd_set "MaxAuthTries"               "3"
+        sshd_set "MaxSessions"                "10"
+        sshd_set "ClientAliveInterval"        "300"   # 5 мин без активности → disconnect
+        sshd_set "ClientAliveCountMax"        "2"
+        sshd_set "LoginGraceTime"             "30"    # 30 сек на аутентификацию
+        sshd_set "LogLevel"                   "VERBOSE"  # нужно для fail2ban
+
+        # ── Проверка синтаксиса конфига ───────────────────────────────────────
+        if sshd -t 2>/dev/null; then
+            run systemctl reload sshd 2>/dev/null || run systemctl reload ssh 2>/dev/null || true
+            log_ok "SSH перезагружен: пароли отключены, только ключи"
+        else
+            log_error "Ошибка синтаксиса sshd_config — откат к резервной копии"
+            run cp "${sshd_cfg}.bak" "$sshd_cfg"
+            return 1
+        fi
+    else
+        echo -e "  ${DIM}[dry-run] настроен sshd_config: PasswordAuthentication no, PubkeyAuthentication yes${RESET}"
+    fi
+
+    log_ok "SSH hardening применён"
+    log_info "PermitRootLogin: prohibit-password (только по ключу)"
+    log_info "PasswordAuthentication: no"
+    log_info "MaxAuthTries: 3 | LoginGraceTime: 30s | ClientAlive: 5min"
+}
+
+# ─── 10. Fail2ban + Recidive ──────────────────────────────────────────────────
+install_fail2ban() {
+    log_section "10 · Fail2ban (SSH + Recidive)"
+
+    if [[ "$SKIP_PACKAGES" == "true" ]]; then
+        log_warn "Установка пакетов пропущена (--skip-packages)"
+        return 0
+    fi
+
+    # ── Установка ─────────────────────────────────────────────────────────────
+    if command -v fail2ban-client &>/dev/null; then
+        log_skip "fail2ban уже установлен ($(fail2ban-client --version 2>/dev/null | head -1))"
+    else
+        log_step "Устанавливаем fail2ban..."
+        if run apt-get install -y -qq fail2ban; then
+            log_ok "fail2ban установлен"
+        else
+            log_error "Не удалось установить fail2ban"
+            return 1
+        fi
+    fi
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+        # ── jail.local — основная конфигурация ───────────────────────────────
+        # Используем jail.local (не jail.conf) — не перезаписывается при обновлении
+        cat > /etc/fail2ban/jail.local << 'F2B'
+# /etc/fail2ban/jail.local
+# Создан server-init.sh — не редактируйте jail.conf
+
+[DEFAULT]
+# ── Глобальные настройки ──────────────────────────────────────────────────────
+bantime          = 1h           # блокировать на 1 час
+findtime         = 10m          # окно поиска попыток
+maxretry         = 5            # макс. попыток в окне findtime
+banaction        = iptables-multiport
+banaction_allports = iptables-allports
+backend          = auto
+usedns           = warn
+logencoding      = auto
+enabled          = false        # джейлы выключены по умолчанию, включаем явно
+
+# ── Уведомления ───────────────────────────────────────────────────────────────
+# destemail = admin@example.com
+# sender    = fail2ban@example.com
+# mta       = sendmail
+# action    = %(action_mwl)s   # раскомментировать для email-уведомлений
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH — основной джейл
+# ─────────────────────────────────────────────────────────────────────────────
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+logpath  = %(sshd_log)s
+backend  = %(sshd_backend)s
+maxretry = 5            # 5 неудачных попыток → бан на 1 час
+bantime  = 1h
+findtime = 10m
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECIDIVE — «рецидивист»
+# Блокирует IP, который уже банился несколько раз подряд
+# Принцип: если IP попал в бан 5+ раз за 24 часа → бан на 2 недели
+# ─────────────────────────────────────────────────────────────────────────────
+[recidive]
+enabled  = true
+filter   = recidive
+logpath  = /var/log/fail2ban.log
+action   = iptables-allports[name=recidive]
+bantime  = 2w           # 2 недели блокировки
+findtime = 1d           # окно поиска: сутки
+maxretry = 5            # 5 банов в сутки → recidive
+F2B
+
+        log_ok "Создан /etc/fail2ban/jail.local"
+
+        # ── Фильтр recidive (должен уже быть, но проверяем) ──────────────────
+        if [[ ! -f /etc/fail2ban/filter.d/recidive.conf ]]; then
+            cat > /etc/fail2ban/filter.d/recidive.conf << 'RECIDIVE'
+# Фильтр для джейла recidive — ищет события бана в логе fail2ban
+[Definition]
+failregex = ^%(__prefix_line)s(?:NOTICE  |WARNING |CRITICAL)?(?:\[\d+\])? Ban <HOST>$
+ignoreregex =
+RECIDIVE
+            log_ok "Создан фильтр recidive.conf"
+        else
+            log_skip "filter.d/recidive.conf уже существует"
+        fi
+
+        # ── Включаем и перезапускаем fail2ban ────────────────────────────────
+        run systemctl enable fail2ban
+        run systemctl restart fail2ban
+
+        # Ждём секунду и проверяем статус
+        sleep 2
+        if systemctl is-active --quiet fail2ban; then
+            log_ok "fail2ban запущен и включён в автозагрузку"
+        else
+            log_warn "fail2ban не запустился — проверьте: journalctl -u fail2ban"
+        fi
+
+        # ── Показываем статус джейлов ─────────────────────────────────────────
+        sleep 1
+        log_info "Статус джейлов:"
+        fail2ban-client status 2>/dev/null | grep -E 'Jail|Number' | while read -r line; do
+            log_info "  $line"
+        done || true
+
+    else
+        echo -e "  ${DIM}[dry-run] создан /etc/fail2ban/jail.local с джейлами sshd + recidive${RESET}"
+    fi
+
+    echo ""
+    log_info "Полезные команды fail2ban:"
+    log_info "  fail2ban-client status          — список джейлов"
+    log_info "  fail2ban-client status sshd     — статус SSH-джейла"
+    log_info "  fail2ban-client status recidive — статус recidive"
+    log_info "  fail2ban-client set sshd unbanip <IP>  — разбанить IP"
+    log_info "  fail2ban-client banned          — список забаненных IP"
+}
+
+# ─── 11. Итоговая проверка ────────────────────────────────────────────────────
 verify_installation() {
     log_section "9 · Итоговая проверка"
 
@@ -1308,6 +1524,8 @@ print_summary() {
   │  7. MOTD cheatsheet при логине + алиас cheatsheet                   │
   │  8. Глобальный .bashrc.d: алиасы, горячие клавиши, функции         │
   │  9. Конфигурация tmux с vim-клавишами и статусной строкой           │
+  │ 10. SSH hardening: только ключи, без паролей                        │
+  │ 11. fail2ban: SSH + recidive (5 банов → 2 недели блокировки)        │
   └─────────────────────────────────────────────────────────────────────┘
 
 SUMMARY
@@ -1316,8 +1534,12 @@ SUMMARY
     echo -e "  ${CYAN}1.${RESET} Перезайдите в SSH или выполните: ${BOLD}source /etc/bash.bashrc${RESET}"
     echo -e "  ${CYAN}2.${RESET} Попробуйте памятку:              ${BOLD}cheatsheet${RESET}"
     echo -e "  ${CYAN}3.${RESET} Проверьте промпт starship:       ${BOLD}exec bash${RESET}"
-    echo -e "  ${CYAN}4.${RESET} Откройте PDF:                    ${BOLD}view-pdf file.pdf${RESET}"
-    echo -e "  ${CYAN}5.${RESET} Покажите изображение:            ${BOLD}chafa image.png${RESET}"
+    echo -e "  ${CYAN}4.${RESET} Статус fail2ban:                 ${BOLD}fail2ban-client status${RESET}"
+    echo -e "  ${CYAN}5.${RESET} Откройте PDF:                    ${BOLD}view-pdf file.pdf${RESET}"
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  ВАЖНО:${RESET} SSH-пароли отключены."
+    echo -e "     Убедитесь, что ваш публичный ключ добавлен в ${BOLD}~/.ssh/authorized_keys${RESET}"
+    echo -e "     до закрытия текущей сессии!"
     echo ""
 }
 
@@ -1345,6 +1567,8 @@ main() {
     install_motd
     configure_tmux
     configure_nano
+    harden_ssh
+    install_fail2ban
     verify_installation
     print_summary
 }
