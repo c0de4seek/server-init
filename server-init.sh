@@ -11,12 +11,19 @@
 #    openSUSE Leap/Tumbleweed           (zypper)
 #
 #  Использование:
-#    sudo bash server-init.sh [--dry-run] [--skip-packages] [--help]
+#    sudo bash server-init.sh [--dry-run] [--skip-packages] [--replace-keys]
+#                             [--ssh-key "<pubkey>"] [--help]
 #
 #  Идемпотентность: скрипт безопасно запускать повторно.
 # ==============================================================================
 
 set -euo pipefail
+
+# ─── Встроенные публичные SSH-ключи владельца ────────────────────────────────
+DEFAULT_SSH_KEYS=(
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKTZInxJwOu59cJICNH4boabF5Bq1XASTnhTNvH1IsmS"
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3H0tLIjwCMCtuoOn9KTU7itiLXBwCpQu94r4v7tHJJFnvmwiYftyiXxGigx4G92b+qB8Chl591mil2p/q3gdqSpPMqNAtlJkrcUcISTEUy1Qd7n0YVwuem+cOiQys+OF8n17yNe5lwsgEbC/cVG4YeFki9BEDU3igdrOeBLdWcDE7tg0ihluO/gY6/+39XK10o7+f7wTZQluV0j1r4n+ycZgMezH8Bl5WF7A2YagRjQBr5Iw6zB++WKxvrnBP7jPmGWhHPXo57ZSRbFz2lr4JSHzlKE9SnfBZ2K4mJvcmRTyuY2/Xq53Eza74SLnCQ866yznjLyDp4UjfXMsDLh97 KostiaevVI"
+)
 
 # ─── Цвета и вспомогательные функции ─────────────────────────────────────────
 RESET='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
@@ -35,17 +42,37 @@ die()         { log_error "$1"; exit 1; }
 # ─── Разбор аргументов ────────────────────────────────────────────────────────
 DRY_RUN=false
 SKIP_PACKAGES=false
+REPLACE_KEYS=false
+EXTRA_SSH_KEYS=()
 
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run)       DRY_RUN=true ;;
-        --skip-packages) SKIP_PACKAGES=true ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift ;;
+        --skip-packages)
+            SKIP_PACKAGES=true
+            shift ;;
+        --replace-keys)
+            REPLACE_KEYS=true
+            shift ;;
+        --ssh-key)
+            [[ $# -lt 2 ]] && die "Флаг --ssh-key требует аргумент с публичным ключом"
+            EXTRA_SSH_KEYS+=("$2")
+            shift 2 ;;
+        --ssh-key=*)
+            EXTRA_SSH_KEYS+=("${1#*=}")
+            shift ;;
         --help|-h)
-            echo "Использование: sudo bash server-init.sh [--dry-run] [--skip-packages]"
-            echo "  --dry-run        Показать что будет сделано без реальных изменений"
-            echo "  --skip-packages  Пропустить установку пакетов (только конфиги)"
+            echo "Использование: sudo bash server-init.sh [опции]"
+            echo "  --dry-run            Показать что будет сделано без реальных изменений"
+            echo "  --skip-packages      Пропустить установку пакетов (только конфиги)"
+            echo "  --ssh-key \"<ключ>\"   Добавить дополнительный публичный SSH-ключ"
+            echo "  --replace-keys       Заменить authorized_keys только ключами из скрипта"
+            echo "  --help, -h           Показать эту справку"
             exit 0 ;;
-        *) die "Неизвестный аргумент: $arg. Используйте --help." ;;
+        *)
+            die "Неизвестный аргумент: $1. Используйте --help." ;;
     esac
 done
 
@@ -60,12 +87,12 @@ run() {
 # ─── Глобальное состояние ОС (заполняется в detect_os) ───────────────────────
 OS_ID=""        # debian, ubuntu, rhel, fedora, arch, alpine, opensuse...
 OS_FAMILY=""    # debian | rhel | arch | alpine | suse
-OS_CODENAME=""  # bullseye, jammy, ...
-OS_VERSION=""   # основная версия (8, 9, 22...)
+OS_CODENAME=""  # bullseye, bookworm, trixie, jammy...
+OS_VERSION=""   # основная версия (11, 12, 13, 22...)
 OS_PRETTY=""    # красивое название для вывода
 PKG_MGR=""      # apt | dnf | yum | pacman | apk | zypper
 HAS_SYSTEMD=true
-SSH_SERVICE="ssh"   # ssh (Debian) или sshd (остальные)
+SSH_SERVICE="ssh"   # ssh (Debian/Ubuntu) или sshd (остальные)
 
 # ─── 0. Определение дистрибутива ─────────────────────────────────────────────
 detect_os() {
@@ -74,7 +101,6 @@ detect_os() {
         OS_CODENAME=$(grep '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "")
         OS_VERSION=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1 2>/dev/null || echo "")
         OS_PRETTY=$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "$OS_ID")
-        # ID_LIKE помогает с производными дистрибутивами
         local id_like; id_like=$(grep '^ID_LIKE=' /etc/os-release | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "")
         [[ -z "$OS_ID" && -n "$id_like" ]] && OS_ID="$id_like"
     fi
@@ -94,7 +120,6 @@ detect_os() {
         opensuse*|suse|sles|leap|tumbleweed)
             OS_FAMILY="suse"; PKG_MGR="zypper"; SSH_SERVICE="sshd" ;;
         *)
-            # Определяем по наличию пакетного менеджера
             if   command -v apt-get &>/dev/null; then OS_FAMILY="debian"; PKG_MGR="apt";    SSH_SERVICE="ssh"
             elif command -v dnf     &>/dev/null; then OS_FAMILY="rhel";   PKG_MGR="dnf";    SSH_SERVICE="sshd"
             elif command -v yum     &>/dev/null; then OS_FAMILY="rhel";   PKG_MGR="yum";    SSH_SERVICE="sshd"
@@ -105,7 +130,6 @@ detect_os() {
             fi ;;
     esac
 
-    # Проверяем наличие systemd
     if ! command -v systemctl &>/dev/null; then
         HAS_SYSTEMD=false
     fi
@@ -114,20 +138,23 @@ detect_os() {
 # ─── Абстракция пакетного менеджера ──────────────────────────────────────────
 pkg_update() {
     case "$PKG_MGR" in
-        apt)    apt-get update -qq ;;
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true ;;
         dnf)    dnf makecache -q --refresh 2>/dev/null || dnf check-update -q 2>/dev/null || true ;;
         yum)    yum makecache -q 2>/dev/null || true ;;
-        pacman) pacman -Sy --noconfirm --quiet 2>/dev/null ;;
-        apk)    apk update -q ;;
-        zypper) zypper refresh -q 2>/dev/null ;;
+        pacman) pacman -Sy --noconfirm --quiet 2>/dev/null || true ;;
+        apk)    apk update -q 2>/dev/null || true ;;
+        zypper) zypper refresh -q 2>/dev/null || true ;;
     esac
 }
 
 pkg_install() {
-    # Устанавливает один пакет, возвращает 0 при успехе
     local pkg="$1"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[dry-run] pkg_install ${pkg}${RESET}"
+        return 0
+    fi
     case "$PKG_MGR" in
-        apt)    apt-get install -y -qq "$pkg" 2>/dev/null ;;
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>/dev/null ;;
         dnf)    dnf install -y -q "$pkg" 2>/dev/null ;;
         yum)    yum install -y -q "$pkg" 2>/dev/null ;;
         pacman) pacman -S --noconfirm --needed --quiet "$pkg" 2>/dev/null ;;
@@ -138,7 +165,6 @@ pkg_install() {
 }
 
 pkg_install_many() {
-    # Устанавливает список пакетов, пропуская недоступные
     local label="${1}"; shift
     local failed=()
     log_step "Устанавливаем: ${label}..."
@@ -157,7 +183,6 @@ svc_enable() {
     if [[ "$HAS_SYSTEMD" == "true" ]]; then
         run systemctl enable "$svc" 2>/dev/null || true
     else
-        # Alpine: OpenRC
         run rc-update add "$svc" default 2>/dev/null || true
     fi
 }
@@ -185,7 +210,7 @@ svc_reload() {
     if [[ "$HAS_SYSTEMD" == "true" ]]; then
         run systemctl reload "$svc" 2>/dev/null || run systemctl restart "$svc" 2>/dev/null || true
     else
-        run rc-service "$svc" reload 2>/dev/null || true
+        run rc-service "$svc" reload 2>/dev/null || run rc-service "$svc" restart 2>/dev/null || true
     fi
 }
 
@@ -202,8 +227,10 @@ svc_is_active() {
 preflight_checks() {
     log_section "Предварительные проверки"
 
-    [[ $EUID -ne 0 ]] && die "Скрипт должен быть запущен с правами root: sudo bash $0"
-    log_ok "Запущен от root"
+    if [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]]; then
+        die "Скрипт должен быть запущен с правами root: sudo bash $0"
+    fi
+    log_ok "Права запуска проверены (root / dry-run)"
 
     detect_os
     if [[ "$OS_FAMILY" == "unknown" || "$PKG_MGR" == "unknown" ]]; then
@@ -218,7 +245,7 @@ preflight_checks() {
         log_ok "Интернет-соединение в порядке"
     fi
 
-    local free_kb; free_kb=$(df /usr --output=avail 2>/dev/null | tail -1 || df / --output=avail | tail -1)
+    local free_kb; free_kb=$(df /usr --output=avail 2>/dev/null | tail -1 || df / --output=avail 2>/dev/null | tail -1 || echo 10485760)
     local free_gb; free_gb=$(( free_kb / 1024 / 1024 ))
     (( free_kb < 2097152 )) \
         && log_warn "Мало места: ${free_gb} ГБ (рекомендуется ≥2 ГБ)" \
@@ -242,11 +269,13 @@ setup_system() {
     else
         log_step "Устанавливаем таймзону Europe/Moscow (было: ${current_tz})"
         if command -v timedatectl &>/dev/null; then
-            run timedatectl set-timezone Europe/Moscow
+            run timedatectl set-timezone Europe/Moscow 2>/dev/null || {
+                run ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
+                [[ "$DRY_RUN" != "true" ]] && echo "Europe/Moscow" > /etc/timezone
+            }
         else
-            # Alpine / без systemd
             run ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
-            echo "Europe/Moscow" | run tee /etc/timezone > /dev/null
+            [[ "$DRY_RUN" != "true" ]] && echo "Europe/Moscow" > /etc/timezone
         fi
         log_ok "Таймзона → Europe/Moscow"
     fi
@@ -254,7 +283,6 @@ setup_system() {
     # ── NTP ──────────────────────────────────────────────────────────────────
     log_step "Настраиваем синхронизацию времени"
     if [[ "$HAS_SYSTEMD" == "true" ]]; then
-        # systemd-timesyncd (Debian/Ubuntu/Arch/RHEL с systemd)
         if command -v timedatectl &>/dev/null; then
             run mkdir -p /etc/systemd/timesyncd.conf.d
             if [[ "$DRY_RUN" != "true" ]]; then
@@ -280,24 +308,41 @@ EOF
         log_warn "NTP-клиент не найден — установите chrony или ntp вручную"
     fi
 
+    # ── Лимит логов systemd-journald (200 МБ) ────────────────────────────────
+    if [[ "$HAS_SYSTEMD" == "true" ]]; then
+        log_step "Ограничиваем размер журнала systemd-journald до 200 МБ"
+        run mkdir -p /etc/systemd/journald.conf.d
+        if [[ "$DRY_RUN" != "true" ]]; then
+            cat > /etc/systemd/journald.conf.d/99-server-init.conf << 'EOF'
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=1month
+EOF
+            systemctl restart systemd-journald 2>/dev/null || true
+        fi
+        log_ok "Лимит systemd-journald: SystemMaxUse=200M"
+    fi
+
     # ── Локали ───────────────────────────────────────────────────────────────
     log_step "Настраиваем локали (en_US.UTF-8 + ru_RU.UTF-8)"
     case "$OS_FAMILY" in
         debian)
-            if ! locale -a 2>/dev/null | grep -q "en_US.utf8"; then
+            if ! locale -a 2>/dev/null | grep -qi "en_US\.utf-\?8"; then
+                pkg_install locales 2>/dev/null || true
+            fi
+            if ! locale -a 2>/dev/null | grep -qi "en_US\.utf-\?8" || ! locale -a 2>/dev/null | grep -qi "ru_RU\.utf-\?8"; then
                 if [[ -f /etc/locale.gen ]]; then
                     run sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
                     run sed -i 's/^# *ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen
                     run locale-gen
                 fi
             else
-                log_skip "Локаль en_US.UTF-8 уже сгенерирована"
+                log_skip "Локали en_US.UTF-8 и ru_RU.UTF-8 уже сгенерированы"
             fi
             run update-locale LANG=en_US.UTF-8 2>/dev/null || true
             ;;
         rhel)
-            # RHEL/Fedora: установить langpack если нет
-            if ! locale -a 2>/dev/null | grep -q "en_US.utf8"; then
+            if ! locale -a 2>/dev/null | grep -qi "en_US\.utf-\?8"; then
                 pkg_install "glibc-langpack-en" 2>/dev/null || true
                 pkg_install "glibc-langpack-ru" 2>/dev/null || true
             fi
@@ -312,9 +357,8 @@ EOF
             [[ "$DRY_RUN" != "true" ]] && echo "LANG=en_US.UTF-8" > /etc/locale.conf
             ;;
         alpine)
-            # Alpine использует musl — нет полного locale support
             log_info "Alpine Linux: ограниченная поддержка локалей (musl libc)"
-            [[ "$DRY_RUN" != "true" ]] && { mkdir -p /etc/profile.d; echo 'export LANG=en_US.UTF-8'; } > /etc/profile.d/locale.sh
+            [[ "$DRY_RUN" != "true" ]] && { mkdir -p /etc/profile.d; echo 'export LANG=en_US.UTF-8' > /etc/profile.d/locale.sh; }
             ;;
         suse)
             run localectl set-locale LANG=en_US.UTF-8 2>/dev/null || true
@@ -339,56 +383,209 @@ EOF
     log_ok "Индекс пакетов обновлён"
 }
 
-# ─── 1б. Дополнительные репозитории ──────────────────────────────────────────
+# ─── 1б. Авто-создание Swap и тюнинг ядра (TCP BBR + sysctl) ─────────────────
+setup_swap() {
+    log_section "1б · Настройка Swap-файла"
+
+    local swap_total_kb=0
+    swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if (( swap_total_kb > 0 )); then
+        local swap_mb=$(( swap_total_kb / 1024 ))
+        log_skip "Swap уже активен (${swap_mb} МБ)"
+        return 0
+    fi
+
+    local ram_kb; ram_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local ram_mb=$(( ram_kb / 1024 ))
+    if (( ram_mb > 4200 )); then
+        log_skip "ОЗУ ${ram_mb} МБ (> 4 ГБ) — создание авто-swap не требуется"
+        return 0
+    fi
+
+    local free_kb; free_kb=$(df / --output=avail 2>/dev/null | tail -1 || echo 0)
+    if (( free_kb < 5242880 )); then
+        log_warn "Свободно менее 5 ГБ на / — пропускаем создание /swapfile"
+        return 0
+    fi
+
+    log_step "ОЗУ ${ram_mb} МБ, swap отсутствует — создаём /swapfile (2 ГБ)..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[dry-run] создание и активация /swapfile (2G)${RESET}"
+        return 0
+    fi
+
+    if [[ ! -f /swapfile ]]; then
+        if ! fallocate -l 2G /swapfile 2>/dev/null; then
+            dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none 2>/dev/null || {
+                log_warn "Не удалось выделить место под /swapfile"
+                rm -f /swapfile
+                return 0
+            }
+        fi
+    fi
+
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1 || true
+    if swapon /swapfile 2>/dev/null; then
+        if ! grep -q '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        log_ok "Swap 2 ГБ (/swapfile) создан, активирован и добавлен в /etc/fstab"
+    else
+        rm -f /swapfile
+        log_warn "Ядро/контейнер не разрешает swapon (например, LXC/OpenVZ) — пропущено"
+    fi
+}
+
+setup_sysctl() {
+    log_section "1в · Сетевой тюнинг (TCP BBR) и параметры ядра"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[dry-run] настройка /etc/sysctl.d/99-server-init.conf (TCP BBR, swappiness=10)${RESET}"
+        return 0
+    fi
+
+    mkdir -p /etc/sysctl.d
+    modprobe tcp_bbr 2>/dev/null || true
+
+    local has_bbr=false
+    if grep -qw "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        has_bbr=true
+        mkdir -p /etc/modules-load.d
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+    fi
+
+    {
+        echo "# /etc/sysctl.d/99-server-init.conf — создано server-init.sh"
+        echo ""
+        echo "# Память и кэш ФС"
+        echo "vm.swappiness = 10"
+        echo "vm.vfs_cache_pressure = 50"
+        echo ""
+        if [[ "$has_bbr" == "true" ]]; then
+            echo "# Алгоритм управления перегрузкой TCP BBR"
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+            echo ""
+        fi
+        echo "# Базовая сетевая защита"
+        echo "net.ipv4.tcp_syncookies = 1"
+        echo "net.ipv4.conf.all.rp_filter = 1"
+        echo "net.ipv4.conf.default.rp_filter = 1"
+        echo "net.ipv4.conf.all.accept_redirects = 0"
+        echo "net.ipv4.conf.default.accept_redirects = 0"
+        echo "net.ipv4.conf.all.send_redirects = 0"
+    } > /etc/sysctl.d/99-server-init.conf
+
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-server-init.conf >/dev/null 2>&1 || true
+
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$current_cc" == "bbr" ]]; then
+        log_ok "TCP BBR активирован (congestion_control = bbr, qdisc = fq)"
+    else
+        log_info "TCP congestion control: ${current_cc} (модуль BBR недоступен в текущем ядре)"
+    fi
+    log_ok "Параметры sysctl применены (vm.swappiness=10, защита сети)"
+}
+
+# ─── 1г. Дополнительные репозитории ──────────────────────────────────────────
 setup_extra_repos() {
-    log_section "1б · Настройка репозиториев"
+    log_section "1г · Настройка репозиториев"
 
     case "$OS_FAMILY" in
-        # ── Debian: contrib, non-free, backports ──────────────────────────────
         debian)
+            # Разделяем собственно Debian и Ubuntu/производные
+            if [[ "$OS_ID" == "ubuntu" ]]; then
+                if command -v add-apt-repository &>/dev/null && [[ "$DRY_RUN" != "true" ]]; then
+                    add-apt-repository -y universe >/dev/null 2>&1 || true
+                    add-apt-repository -y multiverse >/dev/null 2>&1 || true
+                    apt-get update -qq 2>/dev/null || true
+                    log_ok "Ubuntu: репозитории universe и multiverse проверены"
+                else
+                    log_skip "Ubuntu: стандартные репозитории активны"
+                fi
+                return 0
+            elif [[ "$OS_ID" != "debian" ]]; then
+                log_skip "Производный дистрибутив (${OS_ID}) — пропускаем правку Debian sources.list"
+                return 0
+            fi
+
             local src="/etc/apt/sources.list"
+            local deb822="/etc/apt/sources.list.d/debian.sources"
             local changed=false
             local codename="$OS_CODENAME"
             [[ -z "$codename" ]] && codename=$(lsb_release -sc 2>/dev/null || echo "")
             [[ -z "$codename" ]] && { log_skip "Не удалось определить codename — пропускаем backports"; return 0; }
-            log_info "Debian/Ubuntu codename: ${codename}"
+            log_info "Debian codename: ${codename}"
 
             if [[ "$DRY_RUN" != "true" ]]; then
-                # non-free
-                if grep -q "^deb " "$src" 2>/dev/null && ! grep -q "non-free" "$src" 2>/dev/null; then
-                    sed -i '/^deb http.*debian\.org\/debian[[:space:]]/ s/$/ contrib non-free/' "$src" 2>/dev/null || true
-                    changed=true; log_ok "Добавлены contrib non-free"
+                # На Debian 11 (bullseye) старый URL deb.debian.org/debian bullseye-backports удалён (перенесён в archive.debian.org)
+                if [[ "$codename" == "bullseye" && -f "$src" ]]; then
+                    if grep -q "deb\.debian\.org/debian[[:space:]]\+bullseye-backports" "$src" 2>/dev/null; then
+                        sed -i '/deb\.debian\.org\/debian[[:space:]]\+bullseye-backports/d' "$src" 2>/dev/null || true
+                        changed=true
+                        log_info "Удалён устаревший URL deb.debian.org bullseye-backports"
+                    fi
                 fi
-                # security
-                if ! grep -qE "^deb.*security" "$src" 2>/dev/null; then
-                    echo "deb http://security.debian.org/debian-security ${codename}-security main contrib non-free" >> "$src"
-                    changed=true; log_ok "Добавлен ${codename}-security"
+
+                # Начиная с Debian 12 (bookworm) добавился компонент non-free-firmware
+                local nf_components="contrib non-free"
+                if [[ "$codename" != "bullseye" && "$codename" != "buster" ]]; then
+                    nf_components="contrib non-free non-free-firmware"
                 fi
-                # backports (для chafa, bat, более новые версии)
-                if ! grep -q "backports" "$src" 2>/dev/null; then
-                    echo "deb http://deb.debian.org/debian ${codename}-backports main contrib non-free" >> "$src"
-                    changed=true; log_ok "Добавлены ${codename}-backports"
+
+                if [[ -f "$deb822" ]]; then
+                    if ! grep -q "non-free" "$deb822" 2>/dev/null; then
+                        sed -i "s/^Components: main$/Components: main ${nf_components}/" "$deb822" 2>/dev/null || true
+                        changed=true
+                        log_ok "Добавлены ${nf_components} в debian.sources"
+                    fi
+                elif [[ -f "$src" ]]; then
+                    if grep -q "^deb " "$src" 2>/dev/null && ! grep -q "non-free" "$src" 2>/dev/null; then
+                        sed -i "/^deb http.*debian\.org\/debian[[:space:]]/ s/$/ ${nf_components}/" "$src" 2>/dev/null || true
+                        changed=true
+                        log_ok "Добавлены ${nf_components} в sources.list"
+                    fi
+                    if ! grep -qE "^deb.*security" "$src" 2>/dev/null; then
+                        echo "deb http://security.debian.org/debian-security ${codename}-security main ${nf_components}" >> "$src"
+                        changed=true
+                        log_ok "Добавлен ${codename}-security"
+                    fi
+                    if ! grep -q "${codename}-backports" "$src" 2>/dev/null; then
+                        if [[ "$codename" == "bullseye" ]]; then
+                            echo "deb [check-valid-until=no] http://archive.debian.org/debian bullseye-backports main contrib non-free" >> "$src"
+                            log_ok "Добавлен archive.debian.org bullseye-backports"
+                        else
+                            echo "deb http://deb.debian.org/debian ${codename}-backports main ${nf_components}" >> "$src"
+                            log_ok "Добавлен ${codename}-backports"
+                        fi
+                        changed=true
+                    fi
                 fi
-                [[ "$changed" == "true" ]] && { apt-get update -qq; log_ok "apt-get update после обновления источников"; } \
-                    || log_skip "Источники уже настроены"
+
+                if [[ "$changed" == "true" ]]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || log_warn "apt-get update завершился с предупреждениями"
+                    log_ok "Индекс apt обновлён после настройки источников"
+                else
+                    log_skip "Источники Debian уже настроены"
+                fi
             else
-                echo -e "  ${DIM}[dry-run] настройка /etc/apt/sources.list${RESET}"
+                echo -e "  ${DIM}[dry-run] настройка источников Debian (${codename})${RESET}"
             fi
             ;;
 
-        # ── RHEL/CentOS: EPEL + PowerTools/CRB ───────────────────────────────
         rhel)
             log_step "Подключаем EPEL и CRB для RHEL-семейства..."
             if ! rpm -q epel-release &>/dev/null 2>&1; then
                 if [[ "$OS_ID" == "amzn" ]]; then
                     pkg_install "amazon-linux-extras" && run amazon-linux-extras install epel -y 2>/dev/null || true
-                elif (( OS_VERSION >= 9 )); then
-                    pkg_install "epel-release"
-                    # CRB (CodeReady Builder) заменил PowerTools в RHEL9
+                elif (( ${OS_VERSION:-8} >= 9 )); then
+                    pkg_install "epel-release" || true
                     run dnf config-manager --set-enabled crb 2>/dev/null || \
                     run dnf config-manager --set-enabled powertools 2>/dev/null || true
                 else
-                    pkg_install "epel-release"
+                    pkg_install "epel-release" || true
                     run dnf config-manager --set-enabled powertools 2>/dev/null || \
                     run yum-config-manager --enable powertools 2>/dev/null || true
                 fi
@@ -399,15 +596,13 @@ setup_extra_repos() {
             fi
             ;;
 
-        # ── Arch: multilib (опционально) ──────────────────────────────────────
         arch)
             log_skip "Arch Linux: основные репозитории уже включены"
             ;;
 
-        # ── Alpine: community и edge testing ─────────────────────────────────
         alpine)
             if ! grep -q "community" /etc/apk/repositories 2>/dev/null; then
-                local alpine_ver; alpine_ver=$(cat /etc/alpine-release 2>/dev/null | cut -d. -f1-2 || echo "edge")
+                local alpine_ver; alpine_ver=$(cut -d. -f1-2 /etc/alpine-release 2>/dev/null || echo "edge")
                 if [[ "$DRY_RUN" != "true" ]]; then
                     echo "https://dl-cdn.alpinelinux.org/alpine/v${alpine_ver}/community" >> /etc/apk/repositories
                     run apk update -q
@@ -418,7 +613,6 @@ setup_extra_repos() {
             fi
             ;;
 
-        # ── openSUSE: дополнительные репозитории ──────────────────────────────
         suse)
             log_step "Проверяем репозитории openSUSE..."
             run zypper refresh -q 2>/dev/null || true
@@ -433,12 +627,13 @@ install_packages() {
 
     [[ "$SKIP_PACKAGES" == "true" ]] && { log_warn "Установка пакетов пропущена (--skip-packages)"; return 0; }
 
-    # ── Базовые зависимости (специфичны для каждого семейства) ───────────────
     local base_deps=()
     case "$OS_FAMILY" in
         debian)
             base_deps=(curl wget git ca-certificates gnupg apt-transport-https
-                       build-essential unzip poppler-utils) ;;
+                       build-essential unzip poppler-utils)
+            [[ "$OS_ID" == "ubuntu" ]] && base_deps+=(software-properties-common)
+            ;;
         rhel)
             base_deps=(curl wget git ca-certificates gnupg2
                        gcc gcc-c++ make unzip poppler-utils) ;;
@@ -454,26 +649,22 @@ install_packages() {
     esac
     pkg_install_many "Базовые зависимости" "${base_deps[@]}"
 
-    # ── CLI-утилиты (универсальные имена пакетов) ─────────────────────────────
-    # Для пакетов с разными именами используем resolve_pkg()
     local cli_common=(htop ncdu jq tmux tree file lsof strace pv bc rsync socat)
     pkg_install_many "Общие утилиты" "${cli_common[@]}"
 
     # ripgrep
-    case "$OS_FAMILY" in
-        debian|rhel|arch|alpine|suse) pkg_install ripgrep || log_warn "ripgrep: недоступен" ;;
-    esac
+    pkg_install ripgrep || log_warn "ripgrep: недоступен"
 
-    # fd-find (разные имена)
+    # fd-find
     case "$OS_FAMILY" in
         debian)  pkg_install fd-find  || log_warn "fd-find: недоступен" ;;
         arch)    pkg_install fd       || log_warn "fd: недоступен" ;;
         alpine)  pkg_install fd       || log_warn "fd: недоступен" ;;
-        rhel)    pkg_install fd-find  || pkg_install fd || log_warn "fd: недоступен (попробуйте вручную)" ;;
+        rhel)    pkg_install fd-find  || pkg_install fd || log_warn "fd: недоступен" ;;
         suse)    pkg_install fd       || log_warn "fd: недоступен" ;;
     esac
 
-    # bat — разные имена
+    # bat
     case "$OS_FAMILY" in
         debian)
             if ! pkg_install bat 2>/dev/null; then
@@ -482,16 +673,17 @@ install_packages() {
         rhel|arch|alpine|suse) pkg_install bat || log_warn "bat: недоступен" ;;
     esac
 
-    # chafa — рендеринг изображений
+    # chafa
     case "$OS_FAMILY" in
-        debian)  pkg_install chafa || log_warn "chafa: недоступен (нет в Debian 11, добавьте backports)" ;;
-        rhel)    pkg_install chafa || log_warn "chafa: недоступен (нет в EPEL)" ;;
-        arch)    pkg_install chafa || log_warn "chafa: недоступен" ;;
-        alpine)  pkg_install chafa || log_warn "chafa: недоступен" ;;
-        suse)    pkg_install chafa || log_warn "chafa: недоступен" ;;
+        debian)
+            if ! pkg_install chafa 2>/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -t "${OS_CODENAME}-backports" chafa 2>/dev/null \
+                    || log_warn "chafa: недоступен"
+            fi ;;
+        rhel|arch|alpine|suse) pkg_install chafa || log_warn "chafa: недоступен" ;;
     esac
 
-    # DNS утилиты (разные имена)
+    # DNS утилиты
     case "$OS_FAMILY" in
         debian)  pkg_install dnsutils   || log_warn "dnsutils: недоступен" ;;
         rhel)    pkg_install bind-utils || log_warn "bind-utils: недоступен" ;;
@@ -500,9 +692,8 @@ install_packages() {
         suse)    pkg_install bind-utils || log_warn "bind-utils: недоступен" ;;
     esac
 
-    # mtr, iotop, sysstat
-    pkg_install mtr    || log_warn "mtr: недоступен"
-    pkg_install iotop  || log_warn "iotop: недоступен"
+    pkg_install mtr   || log_warn "mtr: недоступен"
+    pkg_install iotop || log_warn "iotop: недоступен"
     case "$OS_FAMILY" in
         debian|rhel|arch|suse) pkg_install sysstat || log_warn "sysstat: недоступен" ;;
         alpine) log_info "sysstat: в Alpine используйте procps" ;;
@@ -519,7 +710,7 @@ install_packages() {
     esac
     pkg_install_many "Архиваторы" "${archivers[@]}"
 
-    # eza / exa — современная замена ls
+    # eza / exa
     case "$OS_FAMILY" in
         debian|rhel|suse)
             if ! pkg_install eza 2>/dev/null; then
@@ -529,12 +720,10 @@ install_packages() {
         alpine) pkg_install eza 2>/dev/null || log_info "eza: недоступен в Alpine" ;;
     esac
 
-    # net-tools
     pkg_install net-tools || log_warn "net-tools: недоступен"
 
     log_ok "Установка CLI-утилит завершена"
 
-    # ── btop, fzf, zoxide, starship ──────────────────────────────────────────
     install_btop
     install_fzf
     install_zoxide
@@ -547,11 +736,18 @@ install_btop() {
 
     pkg_install btop && { log_ok "btop установлен через ${PKG_MGR}"; return 0; }
 
-    # backports (Debian)
-    [[ "$OS_FAMILY" == "debian" ]] && apt-get install -y -qq -t "*-backports" btop 2>/dev/null && {
-        log_ok "btop установлен из backports"; return 0; }
+    if [[ "$OS_FAMILY" == "debian" && -n "$OS_CODENAME" && "$DRY_RUN" != "true" ]]; then
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -t "${OS_CODENAME}-backports" btop 2>/dev/null; then
+            log_ok "btop установлен из ${OS_CODENAME}-backports"
+            return 0
+        fi
+    fi
 
-    # GitHub API
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[dry-run] загрузка btop из GitHub releases${RESET}"
+        return 0
+    fi
+
     local arch; arch=$(uname -m)
     local arch_suffix
     case "$arch" in
@@ -564,7 +760,7 @@ install_btop() {
     local btop_url
     btop_url=$(curl -fsSL "https://api.github.com/repos/aristocratos/btop/releases/latest" 2>/dev/null \
         | grep -o '"browser_download_url": *"[^"]*'"${arch_suffix}"'[^"]*\.\(tbz\|tar\.bz2\)"' \
-        | head -1 | cut -d'"' -f4)
+        | head -1 | cut -d'"' -f4 || true)
 
     [[ -z "$btop_url" ]] && { log_warn "btop: не удалось получить URL из GitHub API"; return 0; }
 
@@ -573,14 +769,16 @@ install_btop() {
     local ext="tbz"; [[ "$btop_url" == *".tar.bz2" ]] && ext="tar.bz2"
 
     if curl -fsSL "$btop_url" -o "${tmp_dir}/btop.${ext}"; then
-        tar -xjf "${tmp_dir}/btop.${ext}" -C "$tmp_dir"
+        tar -xjf "${tmp_dir}/btop.${ext}" -C "$tmp_dir" 2>/dev/null || true
         local btop_bin; btop_bin=$(find "$tmp_dir" -name btop -type f | head -1)
         if [[ -n "$btop_bin" ]]; then
             install -Dm755 "$btop_bin" /usr/local/bin/btop
             log_ok "btop установлен из GitHub release"
+        else
+            log_warn "btop: бинарник не найден в архиве"
         fi
     else
-        log_warn "btop: не удалось загрузить"
+        log_warn "btop: не удалось загрузить архив"
     fi
 }
 
@@ -589,27 +787,37 @@ install_fzf() {
     log_step "Устанавливаем fzf..."
     pkg_install fzf && { log_ok "fzf установлен через ${PKG_MGR}"; return 0; }
 
-    # Официальный скрипт
     if [[ "$DRY_RUN" != "true" ]]; then
         git clone --depth 1 https://github.com/junegunn/fzf.git /tmp/fzf-install 2>/dev/null || true
         if [[ -d /tmp/fzf-install ]]; then
-            bash /tmp/fzf-install/install --bin 2>/dev/null
+            bash /tmp/fzf-install/install --bin 2>/dev/null || true
             [[ -f /tmp/fzf-install/bin/fzf ]] && install -Dm755 /tmp/fzf-install/bin/fzf /usr/local/bin/fzf
             rm -rf /tmp/fzf-install
             log_ok "fzf установлен из GitHub"
         fi
+    else
+        echo -e "  ${DIM}[dry-run] установка fzf из GitHub${RESET}"
     fi
 }
 
 install_zoxide() {
+    # Если zoxide был установлен ранее в /root/.local/bin, переносим в /usr/local/bin
+    if [[ ! -x /usr/local/bin/zoxide && -x /root/.local/bin/zoxide && "$DRY_RUN" != "true" ]]; then
+        install -Dm755 /root/.local/bin/zoxide /usr/local/bin/zoxide
+    fi
+
     command -v zoxide &>/dev/null && { log_skip "zoxide уже установлен ($(zoxide --version 2>/dev/null))"; return 0; }
     log_step "Устанавливаем zoxide..."
     pkg_install zoxide && { log_ok "zoxide установлен через ${PKG_MGR}"; return 0; }
 
-    if run curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash; then
-        log_ok "zoxide установлен через официальный скрипт"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh -s -- --bin-dir /usr/local/bin; then
+            log_ok "zoxide установлен в /usr/local/bin"
+        else
+            log_warn "zoxide: не удалось установить"
+        fi
     else
-        log_warn "zoxide: не удалось установить"
+        echo -e "  ${DIM}[dry-run] установка zoxide в /usr/local/bin${RESET}"
     fi
 }
 
@@ -617,13 +825,16 @@ install_starship() {
     command -v starship &>/dev/null && { log_skip "starship уже установлен ($(starship --version 2>/dev/null | head -1))"; return 0; }
     log_step "Устанавливаем starship..."
 
-    # Arch: из репозитория
     [[ "$OS_FAMILY" == "arch" ]] && pkg_install starship && { log_ok "starship установлен через pacman"; return 0; }
 
-    if run curl -fsSL https://starship.rs/install.sh | sh -s -- --yes; then
-        log_ok "starship установлен"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if curl -fsSL https://starship.rs/install.sh | sh -s -- --yes; then
+            log_ok "starship установлен"
+        else
+            log_warn "starship: не удалось установить"
+        fi
     else
-        log_warn "starship: не удалось установить"
+        echo -e "  ${DIM}[dry-run] установка starship через starship.rs/install.sh${RESET}"
     fi
 }
 
@@ -742,8 +953,6 @@ SCRIPT
 configure_bash() {
     log_section "4 · Настройка Bash"
 
-    # Универсальное расположение для всех дистрибутивов: /etc/profile.d/
-    # + отдельно /etc/bash.bashrc.d/ для Debian-совместимых
     local profile_d_file="/etc/profile.d/99-server-init.sh"
 
     log_step "Создаём глобальную конфигурацию bash"
@@ -754,17 +963,23 @@ configure_bash() {
         cat > "$profile_d_file" << 'BASHRC'
 # ============================================================
 #  /etc/profile.d/99-server-init.sh — Terminal Ergonomics
-#  Загружается всеми sh-совместимыми оболочками при логине
-#  и bash в интерактивном режиме.
+#  Загружается в интерактивных сессиях bash.
 # ============================================================
 
 # Только для интерактивных сессий bash
-[ -z "$BASH_VERSION" ] && return
+[ -z "${BASH_VERSION:-}" ] && return
 [[ $- != *i* ]] && return
+
+# Гарантируем наличие /usr/local/bin в PATH
+case ":$PATH:" in
+    *:/usr/local/bin:*) ;;
+    *) export PATH="/usr/local/bin:$PATH" ;;
+esac
 
 # ─── Редактор по умолчанию ───────────────────────────────────────────────────
 export EDITOR="${EDITOR:-nano}"
 export VISUAL="$EDITOR"
+export STARSHIP_CONFIG="/etc/starship/starship.toml"
 
 # ─── АЛИАСЫ БЫСТРОЙ НАВИГАЦИИ ────────────────────────────────────────────────
 alias ..='cd ..'
@@ -819,9 +1034,8 @@ export HISTTIMEFORMAT='%F %T  '
 shopt -s histappend
 
 # ─── ГОРЯЧИЕ КЛАВИШИ ─────────────────────────────────────────────────────────
-# Полный список в MOTD cheatsheet (команда: cheatsheet)
-bind '"\e[A": history-search-backward' 2>/dev/null || true  # ↑ с фильтром
-bind '"\e[B": history-search-forward'  2>/dev/null || true  # ↓ с фильтром
+bind '"\e[A": history-search-backward' 2>/dev/null || true
+bind '"\e[B": history-search-forward'  2>/dev/null || true
 bind 'set completion-ignore-case on'   2>/dev/null || true
 bind 'set show-all-if-ambiguous on'    2>/dev/null || true
 bind 'set colored-stats on'            2>/dev/null || true
@@ -850,14 +1064,14 @@ command -v zoxide &>/dev/null && eval "$(zoxide init bash)"
 command -v starship &>/dev/null && eval "$(starship init bash)"
 
 # ─── АЛИАСЫ ──────────────────────────────────────────────────────────────────
-alias cheatsheet='bash /etc/profile.d/99-cheatsheet.sh 2>/dev/null || echo "cheatsheet не найден"'
+alias cheatsheet='/usr/local/bin/cheatsheet'
 
 # ─── ФУНКЦИЯ mkcd ────────────────────────────────────────────────────────────
 mkcd() { mkdir -p "$1" && cd "$1" || return 1; }
 
 # ─── ФУНКЦИЯ extract ─────────────────────────────────────────────────────────
 extract() {
-    [[ -z "$1" ]] && { echo "Использование: extract <файл>"; return 1; }
+    [[ -z "${1:-}" ]] && { echo "Использование: extract <файл>"; return 1; }
     [[ ! -f "$1" ]] && { echo "Файл не найден: $1"; return 1; }
     case "$1" in
         *.tar.bz2|*.tbz2) tar xjf "$1"  ;; *.tar.gz|*.tgz) tar xzf "$1"    ;;
@@ -898,7 +1112,6 @@ BASHRC
 
         log_ok "Создан ${profile_d_file}"
 
-        # ── Debian: /etc/bash.bashrc.d/ (интерактивные non-login оболочки) ──
         if [[ "$OS_FAMILY" == "debian" ]]; then
             mkdir -p /etc/bash.bashrc.d
             ln -sf "$profile_d_file" /etc/bash.bashrc.d/99-server-init.sh 2>/dev/null || \
@@ -917,7 +1130,6 @@ EOF
             fi
         fi
 
-        # ── RHEL: /etc/bashrc.d/ ──────────────────────────────────────────────
         if [[ "$OS_FAMILY" == "rhel" ]]; then
             mkdir -p /etc/bashrc.d
             ln -sf "$profile_d_file" /etc/bashrc.d/99-server-init.sh 2>/dev/null || \
@@ -935,12 +1147,6 @@ EOF
                 log_ok "Добавлена загрузка /etc/bashrc.d в /etc/bashrc"
             fi
         fi
-
-        # Экспорт STARSHIP_CONFIG в profile.d
-        if ! grep -q 'STARSHIP_CONFIG' "$profile_d_file" 2>/dev/null; then
-            echo 'export STARSHIP_CONFIG="/etc/starship/starship.toml"' >> "$profile_d_file"
-        fi
-
     else
         echo -e "  ${DIM}[dry-run] создан ${profile_d_file}${RESET}"
     fi
@@ -1032,31 +1238,19 @@ TOML
 install_motd() {
     log_section "6 · MOTD Cheatsheet"
 
-    # Путь к cheatsheet-скрипту (универсальный)
-    local cheatsheet_script="/etc/profile.d/99-cheatsheet.sh"
-
-    # Отключить шумные Debian MOTD
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-        for f in /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news \
-                 /etc/update-motd.d/80-esm /etc/update-motd.d/91-contract-ua-esm-status; do
-            [[ -f "$f" && -x "$f" ]] && { run chmod -x "$f"; log_info "Отключён: $(basename "$f")"; }
-        done
-        # MOTD-скрипт для Debian
-        [[ "$DRY_RUN" != "true" ]] && ln -sf "$cheatsheet_script" /etc/update-motd.d/99-cheatsheet 2>/dev/null || true
-    fi
-
-    # RHEL/Arch/Alpine: добавляем вызов в /etc/profile (выполняется при логине)
-    if [[ "$OS_FAMILY" != "debian" && "$DRY_RUN" != "true" ]]; then
-        if [[ -f /etc/profile ]] && ! grep -q '99-cheatsheet' /etc/profile; then
-            echo "[ -f /etc/profile.d/99-cheatsheet.sh ] && bash /etc/profile.d/99-cheatsheet.sh" >> /etc/profile
-        fi
-    fi
+    local cheatsheet_bin="/usr/local/bin/cheatsheet"
 
     if [[ "$DRY_RUN" != "true" ]]; then
-        cat > "$cheatsheet_script" << 'MOTD'
+        # Удаляем старый /etc/profile.d/99-cheatsheet.sh (если остался от прошлых версий),
+        # чтобы он не дублировал MOTD и не ломал scp/rsync
+        rm -f /etc/profile.d/99-cheatsheet.sh
+        if [[ -f /etc/profile ]]; then
+            sed -i '/99-cheatsheet/d' /etc/profile 2>/dev/null || true
+        fi
+
+        cat > "$cheatsheet_bin" << 'MOTD'
 #!/usr/bin/env bash
-# /etc/profile.d/99-cheatsheet.sh — динамическая памятка при логине
-# Запуск вручную: cheatsheet
+# /usr/local/bin/cheatsheet — динамическая памятка при логине и по команде cheatsheet
 
 RESET=$'\e[0m'; BOLD=$'\e[1m'; DIM=$'\e[2m'
 RED=$'\e[0;31m'; GREEN=$'\e[0;32m'; YELLOW=$'\e[1;33m'
@@ -1074,12 +1268,13 @@ LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "?")
 DATE_STR=$(date '+%A, %d %B %Y  %H:%M %Z')
 TIMEZONE=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "?")
 MEM_INFO=$(free -h 2>/dev/null | awk 'NR==2{printf "%s / %s (своб. %s)",$3,$2,$4}')
-SWAP_INFO=$(free -h 2>/dev/null | awk 'NR==3{if($2=="0B")print "— не настроен"; else printf "%s / %s",$3,$2}')
+SWAP_INFO=$(free -h 2>/dev/null | awk 'NR==3{if($2=="0B" || $2=="0")print "— не настроен"; else printf "%s / %s",$3,$2}')
 DISK_INFO=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s занято из %s (%s)",$3,$2,$5}')
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "?")
 USERS_N=$(who 2>/dev/null | wc -l || echo "?")
-MY_IP=$(echo "$SSH_CLIENT" | awk '{print $1}' 2>/dev/null); [[ -z "$MY_IP" ]] && MY_IP="local"
+MY_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}' 2>/dev/null); [[ -z "$MY_IP" ]] && MY_IP="local"
 COLS=$(tput cols 2>/dev/null || echo 80)
+(( COLS < 40 )) && COLS=80
 LINE=$(printf '%*s' "$COLS" '' | tr ' ' '─')
 
 echo ""
@@ -1173,10 +1368,31 @@ printf "${BOLD}${CYAN}%s${RESET}\n" "$LINE"
 echo ""
 MOTD
 
-        chmod +x "$cheatsheet_script"
-        log_ok "MOTD Cheatsheet: ${cheatsheet_script}"
+        chmod 755 "$cheatsheet_bin"
+        log_ok "Установлена команда: ${cheatsheet_bin}"
+
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            for f in /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news \
+                     /etc/update-motd.d/80-esm /etc/update-motd.d/91-contract-ua-esm-status; do
+                [[ -f "$f" && -x "$f" ]] && { chmod -x "$f"; log_info "Отключён шумный MOTD: $(basename "$f")"; }
+            done
+            mkdir -p /etc/update-motd.d
+            ln -sf "$cheatsheet_bin" /etc/update-motd.d/99-cheatsheet
+            rm -f /etc/profile.d/99-cheatsheet-login.sh
+            log_ok "Подключён PAM MOTD: /etc/update-motd.d/99-cheatsheet"
+        else
+            cat > /etc/profile.d/99-cheatsheet-login.sh << 'LOGIN_HOOK'
+# Вывод памятки один раз при интерактивном входе в терминал
+if [ -n "${BASH_VERSION:-}" ] && [[ $- == *i* ]] && [ -t 1 ] && [ -z "${SERVER_INIT_MOTD_SHOWN:-}" ]; then
+    export SERVER_INIT_MOTD_SHOWN=1
+    /usr/local/bin/cheatsheet
+fi
+LOGIN_HOOK
+            chmod 644 /etc/profile.d/99-cheatsheet-login.sh
+            log_ok "Подключён login-хук: /etc/profile.d/99-cheatsheet-login.sh"
+        fi
     else
-        echo -e "  ${DIM}[dry-run] создан ${cheatsheet_script}${RESET}"
+        echo -e "  ${DIM}[dry-run] создан ${cheatsheet_bin}${RESET}"
     fi
 }
 
@@ -1256,40 +1472,135 @@ NANO
     fi
 }
 
-# ─── 9. SSH Hardening ─────────────────────────────────────────────────────────
+# ─── 9. SSH Hardening + Установка ключей ──────────────────────────────────────
+install_ssh_keys_for_user() {
+    local target_user="$1"
+    local target_home="$2"
+    [[ -z "$target_home" || ! -d "$target_home" ]] && return 0
+
+    local ssh_dir="${target_home}/.ssh"
+    local ak_file="${ssh_dir}/authorized_keys"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[dry-run] обновление ${ak_file} для пользователя ${target_user}${RESET}"
+        return 0
+    fi
+
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    touch "$ak_file"
+
+    local tmp_ak; tmp_ak=$(mktemp)
+
+    if [[ "$REPLACE_KEYS" == "true" ]]; then
+        log_info "Режим --replace-keys: очищаем старые ключи в ${ak_file}"
+    elif [[ -s "$ak_file" ]]; then
+        # Разделяем слипшиеся на одной строке ключи (например, после ключа хостера без \n)
+        sed -E 's/([^\n])(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[^[:space:]]+|sk-(ssh|ecdsa)-[^[:space:]]+)/\1\n\2/g' "$ak_file" >> "$tmp_ak"
+        echo "" >> "$tmp_ak"
+    fi
+
+    # Добавляем встроенные ключи
+    for k in "${DEFAULT_SSH_KEYS[@]}"; do
+        echo "$k" >> "$tmp_ak"
+    done
+
+    # Добавляем ключи, переданные через --ssh-key
+    if [[ ${#EXTRA_SSH_KEYS[@]} -gt 0 ]]; then
+        for k in "${EXTRA_SSH_KEYS[@]}"; do
+            echo "$k" >> "$tmp_ak"
+        done
+    fi
+
+    # Оставляем только валидные строки ключей и дедуплицируем по типу+телу ключа ($1 $2)
+    grep -E '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-(ssh|ecdsa)-)[[:space:]]+[A-Za-z0-9+/=]+' "$tmp_ak" \
+        | awk '!seen[$1" "$2]++' > "${ak_file}.clean" || true
+
+    mv "${ak_file}.clean" "$ak_file"
+    rm -f "$tmp_ak"
+    chmod 600 "$ak_file"
+
+    local target_group
+    target_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
+    chown -R "${target_user}:${target_group}" "$ssh_dir" 2>/dev/null || true
+
+    local count; count=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ak_file" 2>/dev/null || echo 0)
+    log_ok "Пользователь ${target_user}: ${count} валидных SSH-ключей в ${ak_file}"
+}
+
 harden_ssh() {
-    log_section "9 · SSH Hardening"
+    log_section "9 · SSH-ключи и Hardening"
+
+    # 1. Устанавливаем SSH-ключи для root и (если запуск через sudo) для $SUDO_USER
+    install_ssh_keys_for_user "root" "/root"
+
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        local sudo_home
+        sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "/home/${SUDO_USER}")
+        if [[ -d "$sudo_home" ]]; then
+            install_ssh_keys_for_user "$SUDO_USER" "$sudo_home"
+        fi
+    fi
 
     local sshd_cfg="/etc/ssh/sshd_config"
-    [[ ! -f "$sshd_cfg" ]] && { log_warn "sshd_config не найден — SSH не установлен"; return 0; }
+    [[ ! -f "$sshd_cfg" ]] && { log_warn "sshd_config не найден — SSH-сервер не установлен"; return 0; }
 
     # Резервная копия
     if [[ ! -f "${sshd_cfg}.bak" ]]; then
         run cp "$sshd_cfg" "${sshd_cfg}.bak"
         log_ok "Резервная копия: ${sshd_cfg}.bak"
     else
-        log_skip "Резервная копия уже существует"
+        log_skip "Резервная копия ${sshd_cfg}.bak уже существует"
     fi
 
-    # Проверяем и очищаем authorized_keys
     local root_keys="/root/.ssh/authorized_keys"
-    if [[ -f "$root_keys" ]] && grep -qvE '^(ssh-|ecdsa-|sk-|#|$)' "$root_keys" 2>/dev/null; then
-        log_step "Очищаем мусорные строки из authorized_keys..."
-        grep -E '^(ssh-|ecdsa-|sk-)' "$root_keys" | awk '!seen[$0]++' > "${root_keys}.tmp"
-        mv "${root_keys}.tmp" "$root_keys"
-        log_ok "authorized_keys очищен"
+    local key_count=2
+    if [[ "$DRY_RUN" != "true" ]]; then
+        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$root_keys" 2>/dev/null || echo 0)
     fi
 
-    local key_count; key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$root_keys" 2>/dev/null || echo 0)
     if (( key_count == 0 )); then
-        log_warn "ВНИМАНИЕ: нет валидных ключей в authorized_keys!"
-        log_warn "Добавьте ключ ПЕРЕД закрытием текущей сессии — иначе потеряете доступ."
-        log_warn "Пропускаем отключение пароля."
+        log_warn "ВНИМАНИЕ: нет валидных ключей в ${root_keys}!"
+        log_warn "Пропускаем отключение паролей во избежание потери доступа."
         return 0
     fi
-    log_ok "authorized_keys: ${key_count} валидных ключей"
 
     if [[ "$DRY_RUN" != "true" ]]; then
+        # Если поддерживается /etc/ssh/sshd_config.d — пишем приоритетный 00-server-init.conf,
+        # так как в OpenSSH побеждает ПЕРВАЯ встреченная директива (иначе 50-cloud-init.conf
+        # с PasswordAuthentication yes переопределит конец основного sshd_config).
+        if [[ -d /etc/ssh/sshd_config.d ]]; then
+            # Отключаем PasswordAuthentication yes в сторонних cloud-init drop-in файлах
+            for dropin in /etc/ssh/sshd_config.d/*.conf; do
+                [[ ! -f "$dropin" || "$(basename "$dropin")" == "00-server-init.conf" ]] && continue
+                if grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$dropin" 2>/dev/null; then
+                    sed -i -E 's/^[[:space:]]*(PasswordAuthentication[[:space:]]+yes)/# overridden by 00-server-init.conf: \1/I' "$dropin" 2>/dev/null || true
+                    log_info "Отключён PasswordAuthentication yes в $(basename "$dropin")"
+                fi
+            done
+
+            cat > /etc/ssh/sshd_config.d/00-server-init.conf << 'SSHD_DROPIN'
+# /etc/ssh/sshd_config.d/00-server-init.conf — создано server-init.sh
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+X11Forwarding no
+PrintMotd no
+MaxAuthTries 2
+MaxSessions 10
+MaxStartups 3:50:10
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 20
+LogLevel VERBOSE
+SSHD_DROPIN
+            chmod 644 /etc/ssh/sshd_config.d/00-server-init.conf
+            log_ok "Создан приоритетный конфиг: /etc/ssh/sshd_config.d/00-server-init.conf"
+        fi
+
         sshd_set() {
             local d="$1" v="$2"
             if grep -qE "^#?[[:space:]]*${d}[[:space:]]" "$sshd_cfg"; then
@@ -1299,50 +1610,50 @@ harden_ssh() {
             fi
         }
 
-        sshd_set "PermitRootLogin"                "prohibit-password"
-        sshd_set "PasswordAuthentication"         "no"
-        sshd_set "PubkeyAuthentication"           "yes"
-        sshd_set "AuthorizedKeysFile"             ".ssh/authorized_keys"
-        sshd_set "PermitEmptyPasswords"           "no"
-        sshd_set "ChallengeResponseAuthentication" "no"
-        sshd_set "KbdInteractiveAuthentication"   "no"
-        sshd_set "X11Forwarding"                  "no"
-        sshd_set "PrintMotd"                      "no"
-        sshd_set "MaxAuthTries"                   "3"
-        sshd_set "MaxSessions"                    "10"
-        sshd_set "ClientAliveInterval"            "300"
-        sshd_set "ClientAliveCountMax"            "2"
-        sshd_set "LoginGraceTime"                 "30"
-        sshd_set "LogLevel"                       "VERBOSE"
+        sshd_set "PermitRootLogin"              "prohibit-password"
+        sshd_set "PasswordAuthentication"       "no"
+        sshd_set "PubkeyAuthentication"         "yes"
+        sshd_set "AuthorizedKeysFile"           ".ssh/authorized_keys"
+        sshd_set "PermitEmptyPasswords"         "no"
+        sshd_set "KbdInteractiveAuthentication" "no"
+        sshd_set "X11Forwarding"                "no"
+        sshd_set "PrintMotd"                    "no"
+        sshd_set "MaxAuthTries"                 "2"
+        sshd_set "MaxSessions"                  "10"
+        sshd_set "MaxStartups"                  "3:50:10"
+        sshd_set "ClientAliveInterval"          "300"
+        sshd_set "ClientAliveCountMax"          "2"
+        sshd_set "LoginGraceTime"               "20"
+        sshd_set "LogLevel"                     "VERBOSE"
 
         if sshd -t 2>/dev/null; then
-            # SSH_SERVICE определён detect_os() — ssh или sshd
             svc_reload "$SSH_SERVICE"
             log_ok "SSH перезагружен: пароли отключены, только ключи"
         else
             log_error "Ошибка синтаксиса sshd_config — откат"
+            rm -f /etc/ssh/sshd_config.d/00-server-init.conf
             cp "${sshd_cfg}.bak" "$sshd_cfg"
             return 1
         fi
+    else
+        echo -e "  ${DIM}[dry-run] настройка /etc/ssh/sshd_config.d/00-server-init.conf и ${sshd_cfg}${RESET}"
     fi
 
     log_ok "SSH hardening применён"
     log_info "PermitRootLogin: prohibit-password | PasswordAuthentication: no"
-    log_info "MaxAuthTries: 3 | LoginGraceTime: 30s | ClientAlive: 5min"
+    log_info "MaxAuthTries: 2 | MaxStartups: 3:50:10 | LoginGraceTime: 20s"
 }
 
-# ─── 10. Fail2ban + Recidive ──────────────────────────────────────────────────
+# ─── 10. Fail2ban + Recidive (анти-ботнет конфигурация) ───────────────────────
 install_fail2ban() {
-    log_section "10 · Fail2ban (SSH + Recidive)"
+    log_section "10 · Fail2ban (SSH Aggressive + Incremental Ban + Recidive)"
 
     [[ "$SKIP_PACKAGES" == "true" ]] && { log_warn "Пропущено (--skip-packages)"; return 0; }
 
-    # Alpine использует другие механизмы защиты (nftables + cron скрипты)
     if [[ "$OS_FAMILY" == "alpine" ]]; then
-        log_info "Alpine: fail2ban не поддерживает OpenRC напрямую"
-        log_info "Альтернатива: apk add sshguard && rc-update add sshguard default"
+        log_info "Alpine: используем sshguard для OpenRC"
         pkg_install sshguard && svc_enable sshguard && svc_start sshguard \
-            && log_ok "sshguard установлен (аналог fail2ban для Alpine)" \
+            && log_ok "sshguard установлен и запущен" \
             || log_warn "sshguard: недоступен"
         return 0
     fi
@@ -1355,52 +1666,100 @@ install_fail2ban() {
         log_ok "fail2ban установлен"
     fi
 
+    # На Debian/Ubuntu для работы backend = systemd необходим python3-systemd
+    if [[ "$OS_FAMILY" == "debian" && "$HAS_SYSTEMD" == "true" ]]; then
+        pkg_install python3-systemd 2>/dev/null || true
+    fi
+
+    # Гарантируем наличие firewall-бэкенда (nftables или iptables)
+    if ! command -v nft &>/dev/null && ! command -v iptables &>/dev/null; then
+        pkg_install nftables 2>/dev/null || pkg_install iptables 2>/dev/null || true
+    fi
+
     if [[ "$DRY_RUN" != "true" ]]; then
-        # ВАЖНО: fail2ban не поддерживает inline-комментарии после значений!
-        cat > /etc/fail2ban/jail.local << 'F2B'
-# /etc/fail2ban/jail.local
-# Внимание: НЕ используйте inline-комментарии (# ...) после значений!
+        # 1. Выбираем нативный banaction (nftables предпочтительнее на современных ядрах)
+        local f2b_banaction="iptables-multiport"
+        local f2b_banaction_all="iptables-allports"
+        if command -v nft &>/dev/null && [[ -f /etc/fail2ban/action.d/nftables-multiport.conf || -f /etc/fail2ban/action.d/nftables.conf ]]; then
+            f2b_banaction="nftables-multiport"
+            f2b_banaction_all="nftables-allports"
+            log_info "Fail2ban firewall backend: nftables (${f2b_banaction})"
+        else
+            log_info "Fail2ban firewall backend: iptables (${f2b_banaction})"
+        fi
+
+        # 2. Выбираем backend чтения логов для sshd (systemd journal vs файл)
+        local sshd_log_block=""
+        if [[ "$HAS_SYSTEMD" == "true" ]] && python3 -c "import systemd.journal" 2>/dev/null; then
+            sshd_log_block="backend  = systemd"
+            log_info "Fail2ban sshd log backend: systemd journal"
+        elif [[ -f /var/log/auth.log ]]; then
+            sshd_log_block=$'backend  = auto\nlogpath  = /var/log/auth.log'
+            log_info "Fail2ban sshd log backend: /var/log/auth.log"
+        elif [[ -f /var/log/secure ]]; then
+            sshd_log_block=$'backend  = auto\nlogpath  = /var/log/secure'
+            log_info "Fail2ban sshd log backend: /var/log/secure"
+        else
+            touch /var/log/auth.log 2>/dev/null || true
+            sshd_log_block=$'backend  = auto\nlogpath  = /var/log/auth.log'
+            log_info "Fail2ban sshd log backend: /var/log/auth.log (создан)"
+        fi
+
+        # 3. Проверяем поддержку mode = aggressive в фильтре sshd.conf
+        local sshd_mode_line=""
+        if grep -q "mode" /etc/fail2ban/filter.d/sshd.conf 2>/dev/null; then
+            sshd_mode_line="mode     = aggressive"
+        fi
+
+        # ВАЖНО: fail2ban НЕ поддерживает inline-комментарии (# ...) после значений!
+        cat > /etc/fail2ban/jail.local << F2B
+# /etc/fail2ban/jail.local — создано server-init.sh
+# Внимание: НЕ используйте inline-комментарии (# ...) на одной строке со значениями!
 
 [DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-banaction          = iptables-multiport
-banaction_allports = iptables-allports
+bantime            = 4h
+findtime           = 1h
+maxretry           = 3
+bantime.increment  = true
+bantime.rndtime    = 15m
+bantime.factor     = 2
+bantime.maxtime    = 5w
+banaction          = ${f2b_banaction}
+banaction_allports = ${f2b_banaction_all}
 backend            = auto
 usedns             = warn
-logencoding        = auto
+logencoding        = utf-8
 enabled            = false
 
-# ─── SSH ──────────────────────────────────────────────────────────────────────
+# ─── SSH (защита от распределённых и медленных ботнетов) ──────────────────────
+# При отключённом парольном входе 2 ошибки подряд за 1 час = гарантированный бот
 [sshd]
 enabled  = true
 port     = ssh
 filter   = sshd
-logpath  = %(sshd_log)s
-backend  = %(sshd_backend)s
-maxretry = 5
-bantime  = 1h
-findtime = 10m
+${sshd_mode_line}
+${sshd_log_block}
+maxretry = 2
+findtime = 1h
+bantime  = 4h
 
-# ─── RECIDIVE ─────────────────────────────────────────────────────────────────
-# IP попал в бан 5+ раз за сутки → блокировка на 2 недели
+# ─── RECIDIVE (блокировка рецидивистов по всем портам) ────────────────────────
+# 3 бана за 7 дней → полная блокировка всех портов на 4 недели
 [recidive]
 enabled   = true
 filter    = recidive
+backend   = auto
 logpath   = /var/log/fail2ban.log
 banaction = %(banaction_allports)s
-bantime   = 2w
-findtime  = 1d
-maxretry  = 5
+bantime   = 4w
+findtime  = 7d
+maxretry  = 3
 F2B
 
-        log_ok "Создан /etc/fail2ban/jail.local"
+        log_ok "Создан /etc/fail2ban/jail.local (mode=aggressive, maxretry=2, bantime.increment=true)"
 
-        # Убедиться, что лог-файл существует (нужен для recidive)
         touch /var/log/fail2ban.log 2>/dev/null || true
 
-        # Фильтр recidive (если отсутствует)
         if [[ ! -f /etc/fail2ban/filter.d/recidive.conf ]]; then
             cat > /etc/fail2ban/filter.d/recidive.conf << 'RECIDIVE'
 [Definition]
@@ -1410,23 +1769,30 @@ RECIDIVE
             log_ok "Создан фильтр recidive.conf"
         fi
 
+        if ! fail2ban-client -t >/dev/null 2>&1; then
+            log_warn "Проверка fail2ban-client -t выявила предупреждение — проверяем вывод:"
+            fail2ban-client -t 2>&1 | tail -5 | while read -r line; do log_info "  $line"; done || true
+        fi
+
         svc_enable fail2ban
         svc_restart fail2ban
-        sleep 3
+        sleep 2
 
         if svc_is_active fail2ban; then
             log_ok "fail2ban запущен и включён в автозагрузку"
         else
-            log_warn "fail2ban не запустился — лог:"
+            log_warn "fail2ban не запустился — последние строки лога:"
             journalctl -u fail2ban --no-pager -n 15 2>/dev/null \
                 | grep -v "^--" | tail -10 \
-                | while read -r line; do echo -e "  ${RED}│${RESET} ${DIM}${line}${RESET}"; done
+                | while read -r line; do echo -e "  ${RED}│${RESET} ${DIM}${line}${RESET}"; done || true
         fi
 
         sleep 1
         log_info "Статус джейлов:"
         fail2ban-client status 2>/dev/null | grep -E 'Jail|Number' \
             | while read -r line; do log_info "  $line"; done || true
+    else
+        echo -e "  ${DIM}[dry-run] создан /etc/fail2ban/jail.local (aggressive sshd + recidive)${RESET}"
     fi
 
     log_info "fail2ban-client status          — список джейлов"
@@ -1451,6 +1817,7 @@ verify_installation() {
         "pdftoppm:pdftoppm -v"
         "pdftotext:pdftotext -v"
         "view-pdf:view-pdf --help"
+        "cheatsheet:cheatsheet --help"
         "starship:starship --version"
         "zoxide:zoxide --version"
         "fail2ban:fail2ban-client --version"
@@ -1465,7 +1832,10 @@ verify_installation() {
         local bin; bin=$(echo "$cmd" | awk '{print $1}')
 
         if command -v "$bin" &>/dev/null; then
-            local ver; ver=$(eval "$cmd" 2>&1 | head -1 | grep -oP '[\d.]+' | head -1 || echo "ok")
+            local ver="ok"
+            if [[ "$bin" != "cheatsheet" && "$bin" != "view-pdf" ]]; then
+                ver=$(eval "$cmd" 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || echo "ok")
+            fi
             printf "  ${GREEN}✔${RESET}  %-16s  ${DIM}%-8s${RESET}  %s\n" "$name" "OK" "$ver"
         else
             printf "  ${RED}✘${RESET}  %-16s  ${RED}%-8s${RESET}\n" "$name" "MISSING"
@@ -1475,10 +1845,11 @@ verify_installation() {
     echo ""
     local configs=(
         "/etc/profile.d/99-server-init.sh"
-        "/etc/profile.d/99-cheatsheet.sh"
+        "/usr/local/bin/cheatsheet"
         "/usr/local/bin/view-pdf"
         "/etc/tmux.conf"
         "/etc/starship/starship.toml"
+        "/etc/sysctl.d/99-server-init.conf"
         "/etc/ssh/sshd_config.bak"
     )
     printf "  %-44s  %s\n" "КОНФИГ" "СТАТУС"
@@ -1500,31 +1871,31 @@ print_summary() {
 
   Что было настроено:
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  1.  Таймзона → Europe/Moscow, NTP синхронизация                    │
+  │  1.  Таймзона → Europe/Moscow, NTP, лимит journald (200 МБ)        │
   │  2.  Локали: LANG=en_US.UTF-8 + ru_RU.UTF-8                        │
-  │  3.  Дополнительные репозитории (EPEL/backports/community)          │
-  │  4.  CLI-стек: btop, htop, ncdu, rg, fd, jq, tmux, fzf, zoxide     │
-  │  5.  Промпт starship с git, языками и временем выполнения           │
-  │  6.  view-pdf: просмотр PDF в терминале (графика + текст)           │
-  │  7.  chafa: отображение изображений в SSH-сессии                    │
-  │  8.  MOTD cheatsheet при логине + алиас cheatsheet                  │
+  │  3.  Авто-Swap (2 ГБ при RAM ≤ 4 ГБ) + TCP BBR и sysctl-тюнинг      │
+  │  4.  Дополнительные репозитории (EPEL/backports/community)          │
+  │  5.  CLI-стек: btop, htop, ncdu, rg, fd, jq, tmux, fzf, zoxide     │
+  │  6.  Промпт starship с git, языками и временем выполнения           │
+  │  7.  view-pdf + chafa: просмотр PDF и изображений в терминале       │
+  │  8.  MOTD cheatsheet при логине + команда /usr/local/bin/cheatsheet │
   │  9.  Глобальный profile.d: алиасы, горячие клавиши, функции        │
   │  10. Конфигурация tmux с vim-клавишами и статусной строкой          │
-  │  11. SSH hardening: только ключи, без паролей                       │
-  │  12. fail2ban: SSH + recidive (5 банов → 2 недели блокировки)       │
+  │  11. SSH-ключи (2 ключа) + SSH hardening (только по ключам)         │
+  │  12. fail2ban: sshd (aggressive, maxretry=2, increment) + recidive  │
   └─────────────────────────────────────────────────────────────────────┘
 
 SUMMARY
 
     echo -e "  ${BOLD}${GREEN}Следующие шаги:${RESET}"
     echo -e "  ${CYAN}1.${RESET} Перезайдите в SSH или выполните: ${BOLD}source /etc/profile${RESET}"
-    echo -e "  ${CYAN}2.${RESET} Попробуйте памятку:              ${BOLD}cheatsheet${RESET}"
+    echo -e "  ${CYAN}2.${RESET} Вызовите памятку:                ${BOLD}cheatsheet${RESET}"
     echo -e "  ${CYAN}3.${RESET} Проверьте промпт starship:       ${BOLD}exec bash${RESET}"
-    echo -e "  ${CYAN}4.${RESET} Статус fail2ban:                 ${BOLD}fail2ban-client status${RESET}"
-    echo -e "  ${CYAN}5.${RESET} Просмотр изображения:            ${BOLD}chafa image.png${RESET}"
+    echo -e "  ${CYAN}4.${RESET} Статус fail2ban:                 ${BOLD}fail2ban-client status sshd${RESET}"
+    echo -e "  ${CYAN}5.${RESET} Проверка TCP BBR:                ${BOLD}sysctl net.ipv4.tcp_congestion_control${RESET}"
     echo ""
-    echo -e "  ${BOLD}${RED}⚠  ВАЖНО:${RESET} SSH-пароли отключены."
-    echo -e "     Убедитесь, что ваш публичный ключ в ${BOLD}~/.ssh/authorized_keys${RESET}"
+    echo -e "  ${BOLD}${RED}⚠  ВАЖНО:${RESET} SSH-пароли отключены, ваши публичные ключи добавлены в"
+    echo -e "     ${BOLD}~/.ssh/authorized_keys${RESET}. Проверьте вход в новом окне терминала"
     echo -e "     до закрытия текущей сессии!"
     echo ""
 }
@@ -1541,8 +1912,10 @@ main() {
 
     [[ "$DRY_RUN" == "true" ]] && echo -e "  ${YELLOW}⚠  РЕЖИМ DRY-RUN: реальных изменений не будет${RESET}\n"
 
-    preflight_checks       # detect_os() вызывается здесь
+    preflight_checks
     setup_system
+    setup_swap
+    setup_sysctl
     setup_extra_repos
     install_packages
     install_view_pdf

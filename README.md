@@ -1,69 +1,101 @@
 # 🛠 server-init.sh
 
-**Bash-скрипт первичной инициализации «чистого» Debian/Ubuntu-сервера** — превращает голый терминал в удобный, эргономичный инструмент для повседневной работы.
+**Универсальный bash-скрипт первичной инициализации Linux-сервера** — превращает «чистый» VPS в защищённый, оптимизированный и эргономичный инструмент для работы.
 
 ---
 
 ## ⚡ Быстрый старт
 
 ```bash
-# Скачать и запустить
-curl -fsSL https://raw.githubusercontent.com/you/server-init/main/server-init.sh | sudo bash
+# Скачать и запустить одной командой
+curl -fsSL https://raw.githubusercontent.com/c0de4seek/server-init/master/server-init.sh | sudo bash
 
-# Или, если уже скачан:
-sudo bash server-init.sh
+# Добавить дополнительный SSH-ключ при запуске
+curl -fsSL https://raw.githubusercontent.com/c0de4seek/server-init/master/server-init.sh | sudo bash -s -- --ssh-key "ssh-ed25519 AAAA..."
 
-# Убедиться в изменениях без применения:
+# Предпросмотр без внесения изменений
 sudo bash server-init.sh --dry-run
 ```
 
-После выполнения — **перезайти в SSH** или выполнить `source /etc/bash.bashrc`.
+После выполнения — **перезайдите в SSH** или выполните `source /etc/profile`.
+
+---
+
+## 🐧 Поддерживаемые дистрибутивы
+
+| Семейство | Дистрибутивы | Пакетный менеджер | Доп. репозитории |
+|-----------|--------------|-------------------|------------------|
+| **Debian** | Debian 11/12/13, Ubuntu 20.04+, Mint, Kali, Pop!_OS | `apt` | `contrib`, `non-free`, `non-free-firmware`, `backports` (`archive.debian.org` для Debian 11) |
+| **RHEL** | RHEL, CentOS, AlmaLinux, Rocky, Oracle, Fedora, Amazon Linux | `dnf` / `yum` | `EPEL` + `CRB` / `PowerTools` |
+| **Arch** | Arch Linux, Manjaro, EndeavourOS, Garuda | `pacman` | — |
+| **Alpine** | Alpine Linux (OpenRC) | `apk` | `community` + `sshguard` |
+| **SUSE** | openSUSE Leap / Tumbleweed | `zypper` | — |
 
 ---
 
 ## 📦 Что устанавливается и настраивается
 
-### 1. Системная подготовка
+### 1. Системная подготовка и оптимизация VPS
 | Компонент | Что делает |
 |-----------|------------|
-| **Таймзона** | `Europe/Moscow` через `timedatectl` |
-| **NTP** | `systemd-timesyncd` + российские и европейские пулы |
-| **Локали** | `LANG=en_US.UTF-8` (основная, без багов кодировок) + `ru_RU.UTF-8` (для форматирования дат/чисел) |
+| **Таймзона и NTP** | `Europe/Moscow` + `systemd-timesyncd` (российские и европейские пулы) / `chronyd` |
+| **Локали** | `LANG=en_US.UTF-8` (основная, без багов кодировки) + `ru_RU.UTF-8` (формат дат и чисел) |
+| **Лимит `journald`** | `/etc/systemd/journald.conf.d/99-server-init.conf` — `SystemMaxUse=200M` |
+| **Авто-Swap** | Автоматически создаёт и подключает `/swapfile` на **2 ГБ**, если swap отсутствует и ОЗУ ≤ 4 ГБ |
+| **TCP BBR + sysctl** | `/etc/sysctl.d/99-server-init.conf` — включает `bbr` + `fq`, `vm.swappiness=10`, базовую сетевую защиту |
 
-### 2. CLI-стек
+### 2. Безопасность: SSH-ключи, Hardening и Fail2ban
+
+#### Автоматическая установка SSH-ключей
+- Автоматически прописывает встроенные публичные ключи владельца (`ed25519` + `RSA KostiaevVI`) в `~/.ssh/authorized_keys` для `root` и `$SUDO_USER`.
+- Разделяет «слипшиеся» на одной строке ключи, удаляет мусорные строки (например, от роутеров Keenetic/панелей) и дедуплицирует записи.
+- Выставляет строгие права `700` на `~/.ssh` и `600` на `authorized_keys`.
+
+#### SSH Hardening
+- Записывает приоритетный конфиг `/etc/ssh/sshd_config.d/00-server-init.conf` (перекрывая `50-cloud-init.conf` от хостера) и обновляет `/etc/ssh/sshd_config`:
+  - `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, `PubkeyAuthentication yes`
+  - `MaxAuthTries 2`, `MaxStartups 3:50:10`, `LoginGraceTime 20`
+- Проверяет валидность через `sshd -t` перед перезагрузкой с автоматическим откатом при ошибке.
+
+#### Fail2ban (защита от распределённых и медленных ботнетов)
+- Автоматически определяет фаервол (`nftables-multiport` или `iptables-multiport`) и источник логов (`systemd` journal или `/var/log/auth.log`).
+- **`[DEFAULT]`**: прогрессивное увеличение времени бана (`bantime.increment = true`, `bantime.factor = 2`, `bantime.maxtime = 5w`) и случайный разброс времени разбана (`bantime.rndtime = 15m`) против синхронизированных таймеров ботов.
+- **`[sshd]`**: `mode = aggressive` (блокирует также preauth-сканеры), `maxretry = 2` (бан с первого же подключения бота из 2 событий `Found`), `findtime = 1h`, базовый `bantime = 4h`.
+- **`[recidive]`**: 3 бана за 7 дней (`findtime = 7d`, `maxretry = 3`) → полная блокировка всех портов на **4 недели** (`bantime = 4w`).
+
+### 3. CLI-стек
 
 | Утилита | Назначение |
 |---------|------------|
-| `btop` | Красивый мониторинг CPU/RAM/диск/сеть в реальном времени |
+| `btop` | Мониторинг CPU/RAM/диск/сеть в реальном времени |
 | `htop` | Классический интерактивный просмотр процессов |
 | `ncdu` | ncurses-визуализатор дискового пространства |
-| `ripgrep` (`rg`) | Сверхбыстрая замена grep с поддержкой regex |
-| `fd-find` (`fd`) | Современная замена `find` с интуитивным синтаксисом |
-| `jq` | Обработка JSON в командной строке |
+| `ripgrep` (`rg`) | Сверхбыстрая замена `grep` с поддержкой regex |
+| `fd-find` (`fd`) | Современная замена `find` |
+| `jq` | Обработка и форматирование JSON |
 | `tmux` | Мультиплексор терминала: окна, панели, сессии |
 | `fzf` | Интерактивный fuzzy-поиск по истории и файлам |
 | `zoxide` | Умный `cd`: запоминает часто посещаемые директории |
-| `starship` | Информативный и быстрый shell-промпт |
-| `chafa` | Рендеринг изображений прямо в терминале/SSH |
+| `starship` | Быстрый информативный shell-промпт |
+| `chafa` | Рендеринг изображений прямо в терминале по SSH |
 | `bat` / `batcat` | `cat` с подсветкой синтаксиса |
+| `eza` / `exa` | Современная замена `ls` с иконками и git-статусом |
 
-### 3. Утилита `view-pdf`
+### 4. Утилита `view-pdf`
 
-Просмотр PDF-файлов без графической оболочки:
+Просмотр PDF-файлов в терминале без GUI:
 
 ```bash
-view-pdf doc.pdf              # постраничный графический просмотр
-view-pdf doc.pdf --text       # извлечение текстового слоя
+view-pdf doc.pdf              # постраничный графический просмотр (pdftoppm + chafa)
+view-pdf doc.pdf --text       # извлечение текстового слоя (pdftotext)
 view-pdf doc.pdf --page 3     # конкретная страница
-view-pdf doc.pdf --width 120  # ширина в символах (по умолчанию: ширина терминала)
+view-pdf doc.pdf --width 120  # ширина в символах
 view-pdf doc.pdf --dpi 200    # DPI рендеринга (по умолчанию: 150)
 ```
 
-Интерактивная навигация: `h`/`←` — назад, `l`/`→` — вперёд, `q` — выйти, цифра — конкретная страница.
+### 5. Эргономика Bash и MOTD Cheatsheet
 
-### 4. Эргономика Bash
-
-#### Алиасы
+#### Алиасы и функции
 ```bash
 ..          # cd ..
 ...         # cd ../..
@@ -73,70 +105,24 @@ mkcd <dir>  # mkdir + cd
 extract <f> # распаковать архив любого формата
 myip        # показать внутренний и внешний IP
 sysinfo     # краткая системная сводка
-cheatsheet  # показать памятку
+cheatsheet  # вызвать полную памятку (/usr/local/bin/cheatsheet)
 ```
 
-#### Горячие клавиши (сохранены все стандартные)
-
+#### Горячие клавиши
 | Сочетание | Действие |
 |-----------|----------|
 | `Ctrl+A` / `Home` | В начало строки |
 | `Ctrl+E` / `End` | В конец строки |
 | `Alt+B` / `Alt+F` | Назад/вперёд на слово |
 | `Ctrl+W` | Удалить слово слева |
-| `Alt+D` | Удалить слово справа |
-| `Ctrl+U` | Удалить до начала строки |
-| `Ctrl+K` | Удалить до конца строки |
+| `Ctrl+U` / `Ctrl+K` | Удалить до начала / до конца строки |
 | `Ctrl+Y` | Вставить удалённое (yank) |
 | `Ctrl+_` | Отменить (undo) |
-| `Ctrl+R` | Поиск по истории (через fzf) |
+| `Ctrl+R` | Поиск по истории (через `fzf`) |
+| `Ctrl+T` / `Alt+C` | Вставить файл / перейти в папку через `fzf` |
 | `Alt+.` | Вставить последний аргумент |
-| `Ctrl+X Ctrl+E` | Открыть строку в `$EDITOR` |
-| `↑` / `↓` | История с фильтром по набранному |
-
-#### fzf-интеграция
-- **`Ctrl+R`** — поиск по истории через fzf (вместо стандартного reverse-search)
-- **`Ctrl+T`** — найти файл и вставить путь в строку
-- **`Alt+C`** — перейти в директорию через fzf
-
-#### zoxide
-```bash
-z proj      # перейти в /home/user/projects/myproject
-zi          # интерактивный выбор через fzf
-z -         # предыдущая директория
-```
-
-### 5. MOTD Cheatsheet
-
-При логине по SSH автоматически выводится:
-- Системная сводка (хост, ОС, аптайм, нагрузка, память, диск, IP)
-- Памятка по всем установленным инструментам
-
-Вызов в любой момент:
-```bash
-cheatsheet
-```
-
-### 6. Starship промпт
-
-Показывает:
-- Текущую директорию (сокращённую до 4 уровней)
-- Git-ветку и статус файлов (`!` изменено, `+` добавлено, `?` untracked)
-- Версию рантайма проекта (Python 🐍, Node, Rust 🦀, Go 🐹)
-- Время выполнения команды (если > 2 сек)
-- `❯` зелёный / красный — код возврата последней команды
-
-Конфиг: `/etc/starship/starship.toml`
-
-### 7. Tmux
-
-Конфиг `/etc/tmux.conf`:
-- Префикс `Ctrl+B` (+ `Ctrl+A` как дополнительный)
-- `|` — вертикальное разделение, `-` — горизонтальное
-- Навигация между панелями: `Prefix + h/j/k/l` (vim)
-- Мышь включена (скролл, клик, resize)
-- 256 цветов + true color
-- Статусная строка с именем сессии и временем
+| `Ctrl+X Ctrl+E` | Открыть текущую команду в `$EDITOR` |
+| `↑` / `↓` | История с фильтром по набранному префиксу |
 
 ---
 
@@ -144,74 +130,27 @@ cheatsheet
 
 | Файл | Назначение |
 |------|------------|
-| `/etc/bash.bashrc.d/99-server-init.sh` | Глобальная конфигурация bash (алиасы, функции, интеграции) |
-| `/etc/update-motd.d/99-cheatsheet` | MOTD cheatsheet при логине |
-| `/usr/local/bin/view-pdf` | Утилита просмотра PDF |
+| `/etc/profile.d/99-server-init.sh` | Глобальная конфигурация bash (алиасы, функции, интеграции) |
+| `/usr/local/bin/cheatsheet` | Утилита вывода системной сводки и шпаргалки |
+| `/usr/local/bin/view-pdf` | Утилита просмотра PDF в терминале |
 | `/etc/starship/starship.toml` | Конфигурация Starship промпта |
 | `/etc/tmux.conf` | Конфигурация tmux |
-| `/etc/nanorc` | Удобные настройки nano |
-| `/etc/systemd/timesyncd.conf.d/custom.conf` | Конфигурация NTP |
+| `/etc/nanorc` | Настройки редактора nano |
+| `/etc/sysctl.d/99-server-init.conf` | Конфигурация TCP BBR и параметров ядра |
+| `/etc/systemd/journald.conf.d/99-server-init.conf` | Ограничение логов systemd-journald (200 МБ) |
+| `/etc/ssh/sshd_config.d/00-server-init.conf` | Приоритетный конфиг SSH hardening |
+| `/etc/fail2ban/jail.local` | Конфигурация Fail2ban (`sshd` aggressive + `recidive`) |
 
 ---
 
-## 🔧 Аргументы
+## 🔧 Аргументы командной строки
 
-```
+```text
 sudo bash server-init.sh [опции]
 
-  --dry-run        Показать что будет сделано без реальных изменений
-  --skip-packages  Пропустить установку пакетов (только конфиги)
-  --help           Показать справку
-```
-
----
-
-## 🧩 Требования
-
-- Debian 11+ или Ubuntu 20.04+
-- Запуск с правами root (`sudo`)
-- Интернет-соединение (для btop, fzf, zoxide, starship из GitHub)
-- Свободное место: >= 500 МБ (рекомендуется >= 2 ГБ)
-
----
-
-## 🔄 Идемпотентность
-
-Скрипт безопасно запускать повторно:
-- Уже установленные пакеты — пропускаются
-- Уже настроенная таймзона — пропускается
-- Уже подключённые конфиги — не дублируются
-
----
-
-## 📝 Кастомизация
-
-### Сменить редактор по умолчанию
-В `/etc/bash.bashrc.d/99-server-init.sh`:
-```bash
-export EDITOR="vim"  # или micro, helix, mcedit
-```
-
-### Добавить свои алиасы
-Создайте файл `/etc/bash.bashrc.d/50-my-aliases.sh` — он подхватится автоматически.
-
-### Настроить промпт starship
-Редактируйте `/etc/starship/starship.toml` или создайте `~/.config/starship.toml` для переопределения на уровне пользователя.
-
----
-
-## 💡 Примечания по chafa
-
-Chafa поддерживает несколько режимов рендеринга:
-
-| Режим | Терминал | Качество |
-|-------|----------|----------|
-| ANSI/Unicode | Любой | *** |
-| Sixel | mlterm, xterm с `-ti vt340`, WezTerm | **** |
-| Kitty Graphics | Kitty, WezTerm | ***** |
-
-```bash
-chafa --format sixel image.png    # явное указание формата
-chafa --format kitty  image.png
-chafa -s 80x40 image.png          # фиксированный размер
+  --dry-run            Показать что будет сделано без реальных изменений
+  --skip-packages      Пропустить установку пакетов (только конфиги)
+  --ssh-key "<ключ>"   Добавить дополнительный публичный SSH-ключ
+  --replace-keys       Заменить authorized_keys только ключами из скрипта
+  --help, -h           Показать справку
 ```
